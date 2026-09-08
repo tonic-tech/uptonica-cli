@@ -36,11 +36,16 @@ def _account() -> str:
     return getpass.getuser()
 
 
-def _file_store_path() -> Path:
-    # XDG on Linux, ~/.config on macOS too (no reason to diverge — this file
-    # is ours, not a platform convention we need to match).
+def config_dir() -> Path:
+    """Where uptonica keeps non-secret local state (e.g. the default-workspace
+    bookmark in cli.py) alongside the token file below. XDG on Linux, ~/.config
+    on macOS too — this directory is ours, not a platform convention to match."""
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "uptonica" / "token"
+    return Path(base) / "uptonica"
+
+
+def _file_store_path() -> Path:
+    return config_dir() / "token"
 
 
 def file_store_path_hint() -> str:

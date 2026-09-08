@@ -34,6 +34,7 @@ from uptonica.output import banner, emit, err
 from uptonica.secrets import (
     CredentialError,
     clear_token,
+    config_dir,
     file_store_path_hint,
     looks_like_sanctum_token,
     resolve,
@@ -116,8 +117,38 @@ def _token() -> str:
         sys.exit(3)
 
 
+DEFAULT_TENANT_PATH = config_dir() / "default_tenant"
+
+
+def _read_default_tenant() -> str | None:
+    try:
+        return DEFAULT_TENANT_PATH.read_text(encoding="utf-8").strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def _write_default_tenant(value: str) -> None:
+    DEFAULT_TENANT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_TENANT_PATH.write_text(value.strip() + "\n", encoding="utf-8")
+
+
+def _clear_default_tenant() -> bool:
+    try:
+        DEFAULT_TENANT_PATH.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def _tenant(args: argparse.Namespace) -> str | None:
-    return getattr(args, "tenant", None) or os.environ.get("UPTONICA_TENANT") or None
+    # --tenant wins (explicit, one call) over UPTONICA_TENANT (explicit, this
+    # shell) over the stored default (implicit, set once with `tenant use`) —
+    # each level is a deliberately narrower override of the one below it.
+    return (
+        getattr(args, "tenant", None)
+        or os.environ.get("UPTONICA_TENANT")
+        or _read_default_tenant()
+    )
 
 
 class AmbiguousValue(ValueError):
@@ -156,8 +187,29 @@ def _coerce(v: str) -> Any:
     return f if math.isfinite(f) else v
 
 
+def _suggest_tool_names(bad_name: str) -> list[str]:
+    """Best-effort 'did you mean' for a tool_not_found response.
+
+    A failure here (network hiccup, an unexpected payload shape) must never
+    mask or replace the real error the caller is already reporting — so this
+    swallows everything and returns no suggestions rather than raising.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{API}/tools",
+            headers={"Authorization": f"Bearer {_token()}", "Accept": "application/json",
+                     "User-Agent": f"uptonica-cli/{__version__}"},
+        )
+        with _OPENER.open(req, timeout=15) as r:
+            catalog = json.loads(r.read())
+        return _closest_names(bad_name, catalog.get("tools", []))
+    except Exception:
+        return []
+
+
 def _request(method: str, path: str, *, json_body: dict | None = None,
-             tenant: str | None = None, timeout: int = 60) -> Any:
+              tenant: str | None = None, timeout: int = 60,
+              tool_name_for_suggestions: str | None = None) -> Any:
     url = f"{API}{path}"
     headers = {"Authorization": f"Bearer {_token()}", "Accept": "application/json",
                "User-Agent": f"uptonica-cli/{__version__}"}
@@ -188,12 +240,22 @@ def _request(method: str, path: str, *, json_body: dict | None = None,
         _warn_if_deprecated(e.headers)
         body = e.read().decode("utf-8", errors="replace")
         detail = _safe(body[:600])
+        j: dict | None = None
         try:
             j = json.loads(body)
             detail = _safe(j.get("error_description") or j.get("error") or detail)
         except (ValueError, TypeError):
             pass
         err(f"ERROR: HTTP {e.code} {method} {path}\n  {detail}")
+        if (
+            e.code == 404
+            and tool_name_for_suggestions
+            and isinstance(j, dict)
+            and j.get("error") == "tool_not_found"
+        ):
+            suggestions = _suggest_tool_names(tool_name_for_suggestions)
+            if suggestions:
+                err("  Did you mean: " + ", ".join(suggestions) + "?")
         if 400 <= e.code < 500:
             sys.exit(3 if e.code in (401, 403) else (2 if e.code in (400, 404) else 4))
         sys.exit(5)
@@ -236,11 +298,77 @@ def cmd_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Non
 
 def cmd_tools(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     data = _request("GET", "/tools")
+    tools_all = data.get("tools", [])
+
+    if getattr(args, "show", None):
+        target = args.show
+        tool = next(
+            (t for t in tools_all
+             if t.get("name") == target or str(t.get("name", "")).replace(".", "_") == target),
+            None,
+        )
+        if tool is None:
+            err(f"ERROR: '{target}' is not in this token's tool catalog.")
+            suggestions = _closest_names(target, tools_all)
+            if suggestions:
+                err("  Did you mean: " + ", ".join(suggestions) + "?")
+            sys.exit(2)
+        emit(tool, explicit=args.output, pretty_renderer=_render_tool_detail)
+        return
+
+    tools = tools_all
     if getattr(args, "area", None):
-        data = dict(data)
-        data["tools"] = [t for t in data.get("tools", []) if t.get("module") == args.area]
-        data["count"] = len(data["tools"])
+        tools = [t for t in tools if t.get("module") == args.area]
+    if getattr(args, "search", None):
+        term = args.search.lower()
+        tools = [
+            t for t in tools
+            if term in str(t.get("name", "")).lower()
+            or term in str(t.get("label", "")).lower()
+            or term in str(t.get("description", "")).lower()
+        ]
+
+    data = dict(data, tools=tools, count=len(tools))
     emit(data, explicit=args.output, pretty_renderer=_render_tools)
+
+
+def _closest_names(target: str, tools: list[dict]) -> list[str]:
+    import difflib
+    return difflib.get_close_matches(target, [t["name"] for t in tools if "name" in t], n=3, cutoff=0.4)
+
+
+def cmd_tenant_use(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    # Validated against whoami rather than stored blind — a typo'd slug saved
+    # silently would make every later `call` fail with a server-side 403/404
+    # instead of a clear error right here, where the person can still see
+    # what they typed.
+    data = _request("GET", "/whoami")
+    target = args.tenant
+    match = next(
+        (t for t in data.get("tenants", []) if t.get("slug") == target or str(t.get("id")) == target),
+        None,
+    )
+    if match is None:
+        err(f"ERROR: '{target}' is not a workspace this token reaches.")
+        err("  Run `uptonica whoami` to see what it can reach.")
+        sys.exit(2)
+    _write_default_tenant(match["slug"])
+    banner(f"Default workspace set to {match['slug']} ({match.get('name', '')}).")
+
+
+def cmd_tenant_show(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    current = _read_default_tenant()
+    if current is None:
+        banner("No default workspace set. Pass --tenant explicitly, or run: uptonica tenant use <slug>")
+    else:
+        print(current)  # plain stdout: scriptable, no decoration
+
+
+def cmd_tenant_clear(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if _clear_default_tenant():
+        banner("Default workspace cleared.")
+    else:
+        banner("No default workspace was set.")
 
 
 def cmd_call(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -309,7 +437,10 @@ def cmd_call(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         banner(f"[WILL APPLY] {args.tool} on {tenant or '(default)'} — resubmitting with confirmation")
         body["confirmation_token"] = args.confirm.strip()
 
-    data = _request("POST", f"/tools/{urllib.parse.quote(args.tool, safe='.')}", json_body=body, tenant=tenant)
+    data = _request(
+        "POST", f"/tools/{urllib.parse.quote(args.tool, safe='.')}",
+        json_body=body, tenant=tenant, tool_name_for_suggestions=args.tool,
+    )
     emit(data, explicit=args.output, pretty_renderer=_render_call)
 
 
@@ -360,12 +491,17 @@ def _render_whoami(d: dict) -> None:
     u = d.get("user", {})
     print(f"{_safe(u.get('email', '?'))}" + ("  (admin)" if u.get("is_admin") else ""))
     print(f"write access: {'yes' if d.get('can_write') else 'no'}")
+    default_tenant = _read_default_tenant()
+    if default_tenant:
+        print(f"default workspace: {_safe(default_tenant)}  (change with: uptonica tenant use <slug>)")
     tenants = d.get("tenants", [])
     print(f"workspaces ({d.get('tenant_count', len(tenants))}):")
     for t in tenants[:20]:
         print(f"  {_safe(t.get('slug')):<40} {_safe(t.get('name', ''))}")
     if len(tenants) > 20:
         print(f"  ... and {len(tenants) - 20} more (use --output json to see all)")
+    if not default_tenant and len(tenants) > 1:
+        print("\nTip: `uptonica tenant use <slug>` sets a default so `call` doesn't need --tenant every time.")
 
 
 def _render_tools(d: dict) -> None:
@@ -373,6 +509,32 @@ def _render_tools(d: dict) -> None:
     for t in d.get("tools", []):
         mark = "write" if not t.get("read_only", True) else "read"
         print(f"  [{mark:5}] {_safe(t.get('name')):<32} {_safe(t.get('label', ''))}")
+
+
+def _render_tool_detail(t: dict) -> None:
+    print(_safe(t.get("name", "?")))
+    if t.get("label"):
+        print(f"  {_safe(t['label'])}")
+    kind = "read-only" if t.get("read_only", True) else "write"
+    print(f"  module: {_safe(t.get('module', '?'))}   {kind}")
+    if t.get("description"):
+        print(f"\n{_safe(t['description'])}")
+
+    params = t.get("parameters") or {}
+    required = set(t.get("required") or [])
+    if not params:
+        print("\nparameters: none")
+        return
+    print("\nparameters:")
+    for name, spec in params.items():
+        spec = spec if isinstance(spec, dict) else {}
+        flag = " (required)" if name in required else ""
+        ptype = spec.get("type", "any")
+        desc = spec.get("description")
+        line = f"  {_safe(name)}: {_safe(ptype)}{flag}"
+        if desc:
+            line += f" — {_safe(desc)}"
+        print(line)
 
 
 def _render_call(d: dict) -> None:
@@ -412,8 +574,9 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "examples:\n"
             "  uptonica whoami\n"
-            "  uptonica call catalog.stats.summary --tenant my-store\n"
-            "  uptonica tools --area crm\n"
+            "  uptonica tenant use my-store\n"
+            "  uptonica call catalog.stats.summary\n"
+            "  uptonica tools --search contact\n"
         ),
         parents=[output_parent],
     )
@@ -426,9 +589,31 @@ def _build_parser() -> argparse.ArgumentParser:
                          parents=[output_parent])
     sp.set_defaults(func=cmd_whoami)
 
-    sp = sub.add_parser("tools", help="List tools this token can call", parents=[output_parent])
+    sp = sub.add_parser(
+        "tools", help="List, search, or describe the tools this token can call",
+        parents=[output_parent],
+        epilog=(
+            "examples:\n"
+            "  uptonica tools --area crm\n"
+            "  uptonica tools --search contact\n"
+            "  uptonica tools --show catalog.product.get\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sp.add_argument("--area", help="Filter to one module (e.g. catalog, ads, crm)")
+    sp.add_argument("--search", help="Filter to tools whose name, label, or description matches (substring, case-insensitive)")
+    sp.add_argument("--show", metavar="TOOL", help="Print full detail (description, parameters) for one tool")
     sp.set_defaults(func=cmd_tools)
+
+    sp = sub.add_parser("tenant", help="Manage the default workspace for `call`")
+    tenant_sub = sp.add_subparsers(dest="tenant_command", required=True, metavar="<command>")
+    tu = tenant_sub.add_parser("use", help="Set the default workspace (validated against whoami)")
+    tu.add_argument("tenant", help="Workspace slug or id")
+    tu.set_defaults(func=cmd_tenant_use)
+    tsh = tenant_sub.add_parser("show", help="Print the current default workspace, if any")
+    tsh.set_defaults(func=cmd_tenant_show)
+    tc = tenant_sub.add_parser("clear", help="Unset the default workspace")
+    tc.set_defaults(func=cmd_tenant_clear)
 
     sp = sub.add_parser(
         "call", help="Invoke a tool", parents=[output_parent],
