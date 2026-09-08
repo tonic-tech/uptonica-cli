@@ -363,6 +363,7 @@ def cmd_tools(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
         tools = [
             t for t in tools
             if term in str(t.get("name", "")).lower()
+            or term in str(t.get("catalog_name", "")).lower()
             or term in str(t.get("label", "")).lower()
             or term in str(t.get("description", "")).lower()
         ]
@@ -563,12 +564,19 @@ def _render_tools(d: dict) -> None:
     print(f"{d.get('count', 0)} tools, areas: {', '.join(_safe(a) for a in (d.get('areas') or ['(unrestricted)']))}")
     for t in d.get("tools", []):
         mark = "write" if not t.get("read_only", True) else "read"
-        print(f"  [{mark:5}] {_safe(t.get('name')):<32} {_safe(t.get('label', ''))}")
+        # catalog_name is the human-readable name (e.g. "Catalog · Product · Get").
+        # `label` is a first-person chat status phrase ("Sto leggendo..."), never
+        # meant to be read outside the chat "thinking" chip — fall back to it only
+        # against an older server that hasn't shipped catalog_name yet.
+        display_name = t.get("catalog_name") or t.get("label") or ""
+        print(f"  [{mark:5}] {_safe(t.get('name')):<32} {_safe(display_name)}")
 
 
 def _render_tool_detail(t: dict) -> None:
     print(_safe(t.get("name", "?")))
-    if t.get("label"):
+    if t.get("catalog_name"):
+        print(f"  {_safe(t['catalog_name'])}")
+    elif t.get("label"):
         print(f"  {_safe(t['label'])}")
     kind = "read-only" if t.get("read_only", True) else "write"
     print(f"  module: {_safe(t.get('module', '?'))}   {kind}")
@@ -656,7 +664,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sp.add_argument("--area", help="Filter to one module (e.g. catalog, ads, crm)")
-    sp.add_argument("--search", help="Filter to tools whose name, label, or description matches (substring, case-insensitive)")
+    sp.add_argument("--search", help="Filter to tools whose name, catalog name, label, or description matches (substring, case-insensitive)")
     sp.add_argument("--show", metavar="TOOL", help="Print full detail (description, parameters) for one tool")
     sp.set_defaults(func=cmd_tools)
 
