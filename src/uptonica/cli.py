@@ -1,32 +1,17 @@
 """
 uptonica — the Uptonica command-line client.
 
-One binary. What you can do is decided by the token you configure, not by
-which command you type: a plain workspace token reaches your own store(s);
-a token minted with broader scope (Settings -> API Tokens -> "Terminal
-access") reaches whatever workspaces and tool areas you picked when you
-made it, including several client workspaces if you manage more than one
-(agencies: OperatorTenantResolver already unions your own store, if you
-manage sub-tenants, at makes yours).
+What you can do is decided by the token you configure, not by which
+command you type: a plain token reaches your own workspace(s); a token
+minted with broader scope reaches whatever workspaces and tool areas you
+picked when you made it — including several client workspaces if you
+manage more than one (agencies get this automatically, scoped to the
+clients they actually manage).
 
 Get a token:  https://app.uptonica.com/account/api-tokens
 Store it:     uptonica config set-token
 
-Commands:
-  whoami                          Who this token is, and which workspace(s) it reaches
-  tools                           List tools this token can call (self-describing catalog)
-  call <tool> [args...]           Invoke a tool
-  config set-token                Save a token (Keychain on macOS, else a 0600 file)
-  config show                     Where the token resolves from (never prints the value)
-
-`call` argument shapes:
-  --tenant SLUG_OR_ID              Which workspace, if your token reaches more than one
-  --arg key=value                  Value auto-typed (true/false/int/float/string)
-  --arg-string key=value            Value kept as a literal string, no auto-typing
-  --json '{"key": "value"}'        Whole argument body as JSON (mutually exclusive with --arg*)
-  --dry-run                        Preview a write tool without executing it
-  --confirm TOKEN                  Resubmit a write tool after it returned confirmation_required
-
+Run `uptonica <command> --help` for details on a specific command.
 Exit codes: 0 ok | 2 usage error | 3 auth/forbidden | 4 4xx from the API | 5 5xx | 124 timeout
 """
 
@@ -421,11 +406,21 @@ def _build_parser() -> argparse.ArgumentParser:
     output_parent.add_argument("--output", choices=["json"], default=None,
                                 help="Force JSON output (default: JSON when piped, a short summary in a terminal)")
 
-    p = argparse.ArgumentParser(prog="uptonica", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter,
-                                 parents=[output_parent])
+    p = argparse.ArgumentParser(
+        prog="uptonica", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  uptonica whoami\n"
+            "  uptonica call catalog.stats.summary --tenant my-store\n"
+            "  uptonica tools --area crm\n"
+        ),
+        parents=[output_parent],
+    )
     p.add_argument("--version", action="version", version=f"uptonica {__version__}")
-    sub = p.add_subparsers(dest="command", required=True)
+    # metavar hides argparse's default "{whoami,tools,call,config}" — that's
+    # already spelled out, one per line with its own help text, right below.
+    sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
 
     sp = sub.add_parser("whoami", help="Who this token is, and which workspace(s) it reaches",
                          parents=[output_parent])
@@ -435,7 +430,28 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--area", help="Filter to one module (e.g. catalog, ads, crm)")
     sp.set_defaults(func=cmd_tools)
 
-    sp = sub.add_parser("call", help="Invoke a tool", parents=[output_parent])
+    sp = sub.add_parser(
+        "call", help="Invoke a tool", parents=[output_parent],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Invoke a tool. Run `uptonica tools` to see what your token can call,\n"
+                     "and what arguments each one takes.",
+        epilog=(
+            "argument shapes:\n"
+            "  --arg key=value         auto-typed: true/false, 123, 4.5, else a string\n"
+            "  --arg-string key=value  kept as a literal string, no auto-typing\n"
+            "  --json '{\"k\": \"v\"}'     whole argument body as JSON (exclusive with --arg*)\n"
+            "\n"
+            "confirming a write:\n"
+            "  a write tool that needs confirmation returns a confirmation_token; re-run\n"
+            "  the same command with --confirm <token> within ~15 minutes to apply it.\n"
+            "  --dry-run previews a write without executing it.\n"
+            "\n"
+            "examples:\n"
+            "  uptonica call catalog.product.get --tenant my-store --arg id=42\n"
+            "  uptonica call crm.deal.create --arg title=\"Follow up\" --arg value=990.0\n"
+            "  uptonica call crm.deal.create --arg title=\"Follow up\" --confirm ct_abc123\n"
+        ),
+    )
     sp.add_argument("tool", help="Dotted tool name, e.g. catalog.stats.summary")
     sp.add_argument("--tenant", help="Workspace slug or id, if your token reaches more than one")
     sp.add_argument("--arg", action="append", default=[], metavar="key=value", help="Auto-typed argument")
@@ -449,7 +465,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_call)
 
     cfg = sub.add_parser("config", help="Manage the stored token")
-    cfg_sub = cfg.add_subparsers(dest="config_command", required=True)
+    cfg_sub = cfg.add_subparsers(dest="config_command", required=True, metavar="<command>")
     st = cfg_sub.add_parser("set-token", help="Save a token")
     st_group = st.add_mutually_exclusive_group()
     st_group.add_argument("--token", help="Provide the token non-interactively — shows up in shell "
