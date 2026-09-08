@@ -23,14 +23,20 @@ uptonica config set-token
 
 ```bash
 uptonica whoami
-uptonica tools
+uptonica tenant use my-store          # set a default so you don't repeat --tenant
+uptonica tools --search contact       # find a tool without scrolling the whole catalog
+uptonica tools --show catalog.product.get   # see its full description + parameters
 uptonica call catalog.stats.summary
-uptonica call crm.contact.create_task --tenant my-store --arg title="Follow up" --arg priority=2
+uptonica call crm.contact.create_task --arg title="Follow up" --arg priority=2
 ```
+
+If your token reaches more than one workspace, `--tenant` on any command
+overrides the default for that one call.
 
 A write tool that needs confirmation returns a `confirmation_token`; re-run
 the same command with `--confirm <token>` within ~15 minutes to actually
-apply it. `--dry-run` previews a write without executing it.
+apply it. `--dry-run` previews a write without executing it. A tool name
+that doesn't exist gets a "did you mean" suggestion instead of a bare error.
 
 ## Status
 

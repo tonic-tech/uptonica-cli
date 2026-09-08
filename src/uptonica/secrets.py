@@ -36,11 +36,16 @@ def _account() -> str:
     return getpass.getuser()
 
 
-def _file_store_path() -> Path:
-    # XDG on Linux, ~/.config on macOS too (no reason to diverge — this file
-    # is ours, not a platform convention we need to match).
+def config_dir() -> Path:
+    """Where uptonica keeps non-secret local state (e.g. the default-workspace
+    bookmark in cli.py) alongside the token file below. XDG on Linux, ~/.config
+    on macOS too — this directory is ours, not a platform convention to match."""
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "uptonica" / "token"
+    return Path(base) / "uptonica"
+
+
+def _file_store_path() -> Path:
+    return config_dir() / "token"
 
 
 def file_store_path_hint() -> str:
@@ -56,31 +61,39 @@ def _try_file_store() -> str | None:
         return None
 
 
-def file_store_set(value: str) -> Path:
-    """Write the token so it is NEVER readable by anyone but the owner, not
-    even for the instant between write and chmod.
+def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
+    """Write `path` so it is NEVER readable/overwritable in a half-finished or
+    hijacked state — used for the token file AND for the (non-secret)
+    default-workspace bookmark, so both get the same guarantees rather than
+    the bookmark growing a second, weaker, write path over time.
 
     `os.O_CREAT | os.O_EXCL`-then-write-then-chmod still has a window; instead
     the mode is passed to `os.open` itself (masked by umask, so verified after)
     and the write goes to a temp file that is `os.replace`'d into place —
     atomic on POSIX, so a crash mid-write leaves either nothing or a complete,
     correctly-permissioned file, never a partial one at the real path.
-    `O_NOFOLLOW` refuses to write through a pre-existing symlink.
+    `O_NOFOLLOW` refuses to write through a pre-existing symlink at either the
+    temp name or (via `os.replace`, which never follows the destination) the
+    real one.
     """
-    path = _file_store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)  # mkdir's mode is a no-op when the dir already existed
 
     tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(value.strip() + "\n")
-        os.chmod(tmp, 0o600)  # belt-and-braces against an unexpected umask
+            fh.write(content)
+        os.chmod(tmp, mode)  # belt-and-braces against an unexpected umask
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def file_store_set(value: str) -> Path:
+    path = _file_store_path()
+    atomic_write_text(path, value.strip() + "\n", mode=0o600)
     return path
 
 
