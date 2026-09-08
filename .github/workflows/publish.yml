@@ -1,0 +1,47 @@
+name: Publish to PyPI
+
+# Trusted Publishing (OIDC) — no PyPI API token stored anywhere. PyPI checks
+# the OIDC claims this job presents (repo, workflow file, environment) against
+# the publisher registered on pypi.org, so the only thing that grants publish
+# rights is: pushing to THIS workflow file, in THIS repo, running under the
+# "pypi" environment below.
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {} # manual run, e.g. to retry a failed publish
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC — do not add other permissions here
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Gated on a GitHub Actions "environment" named exactly `pypi` — this is
+    # what the Environment name field in PyPI's Trusted Publisher form
+    # matches against. An environment can require reviewers before this job
+    # runs, so a release doesn't publish without a human looking at it.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/uptonica/
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
