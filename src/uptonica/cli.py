@@ -33,6 +33,7 @@ import re
 from uptonica.output import banner, emit, err
 from uptonica.secrets import (
     CredentialError,
+    atomic_write_text,
     clear_token,
     config_dir,
     file_store_path_hint,
@@ -119,17 +120,32 @@ def _token() -> str:
 
 DEFAULT_TENANT_PATH = config_dir() / "default_tenant"
 
+# What a tenant slug/id may look like. Applied both when STORING it (a
+# malformed value here is unusable later) and after READING it back from
+# disk — the file is ours, but treating a value we wrote ourselves as trusted
+# just because we wrote it is how a bug in an earlier version becomes a
+# standing hazard in every later one. This also bounds what can ever reach
+# `X-Uptonica-Tenant` from this path: no newlines, no header-folding
+# whitespace, no surprises.
+TENANT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
 
 def _read_default_tenant() -> str | None:
     try:
-        return DEFAULT_TENANT_PATH.read_text(encoding="utf-8").strip() or None
-    except FileNotFoundError:
+        raw = DEFAULT_TENANT_PATH.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        # A directory where a file should be, a permissions error, a
+        # decoding failure — any of these must fall back to "no default" and
+        # nothing else, since this is called from `whoami` and every `call`.
+        # An exception here would take out both.
         return None
+    if not raw or not TENANT_SLUG_RE.match(raw):
+        return None
+    return raw
 
 
 def _write_default_tenant(value: str) -> None:
-    DEFAULT_TENANT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DEFAULT_TENANT_PATH.write_text(value.strip() + "\n", encoding="utf-8")
+    atomic_write_text(DEFAULT_TENANT_PATH, value.strip() + "\n", mode=0o600)
 
 
 def _clear_default_tenant() -> bool:
@@ -140,15 +156,29 @@ def _clear_default_tenant() -> bool:
         return False
 
 
+def _tenant_with_source(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Same resolution as `_tenant()`, but also says WHERE the value came
+    from — so a caller can warn when a workspace was chosen by state the
+    person didn't type in this command (the stored default), as opposed to
+    something explicit (`--tenant`, `UPTONICA_TENANT`) that needs no such
+    warning."""
+    explicit = getattr(args, "tenant", None)
+    if explicit:
+        return explicit, "flag"
+    env = os.environ.get("UPTONICA_TENANT")
+    if env:
+        return env, "env"
+    default = _read_default_tenant()
+    if default:
+        return default, "default"
+    return None, None
+
+
 def _tenant(args: argparse.Namespace) -> str | None:
     # --tenant wins (explicit, one call) over UPTONICA_TENANT (explicit, this
     # shell) over the stored default (implicit, set once with `tenant use`) —
     # each level is a deliberately narrower override of the one below it.
-    return (
-        getattr(args, "tenant", None)
-        or os.environ.get("UPTONICA_TENANT")
-        or _read_default_tenant()
-    )
+    return _tenant_with_source(args)[0]
 
 
 class AmbiguousValue(ValueError):
@@ -187,17 +217,25 @@ def _coerce(v: str) -> Any:
     return f if math.isfinite(f) else v
 
 
-def _suggest_tool_names(bad_name: str) -> list[str]:
+def _suggest_tool_names(bad_name: str, token: str) -> list[str]:
     """Best-effort 'did you mean' for a tool_not_found response.
 
     A failure here (network hiccup, an unexpected payload shape) must never
     mask or replace the real error the caller is already reporting — so this
     swallows everything and returns no suggestions rather than raising.
+
+    Takes the ALREADY-RESOLVED token rather than calling `_token()` again:
+    that would re-run the Keychain/file lookup a second time, and on
+    failure raises via `sys.exit()` — a `SystemExit`, which is a
+    `BaseException` and so is NOT caught by `except Exception` below. That
+    let a resolver hiccup here escape and replace the real error (a 404)
+    with an unrelated exit code, which is exactly the outcome this
+    function's docstring promises never happens.
     """
     try:
         req = urllib.request.Request(
             f"{API}/tools",
-            headers={"Authorization": f"Bearer {_token()}", "Accept": "application/json",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
                      "User-Agent": f"uptonica-cli/{__version__}"},
         )
         with _OPENER.open(req, timeout=15) as r:
@@ -210,8 +248,9 @@ def _suggest_tool_names(bad_name: str) -> list[str]:
 def _request(method: str, path: str, *, json_body: dict | None = None,
               tenant: str | None = None, timeout: int = 60,
               tool_name_for_suggestions: str | None = None) -> Any:
+    token = _token()
     url = f"{API}{path}"
-    headers = {"Authorization": f"Bearer {_token()}", "Accept": "application/json",
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
                "User-Agent": f"uptonica-cli/{__version__}"}
     if tenant:
         headers["X-Uptonica-Tenant"] = tenant
@@ -253,9 +292,9 @@ def _request(method: str, path: str, *, json_body: dict | None = None,
             and isinstance(j, dict)
             and j.get("error") == "tool_not_found"
         ):
-            suggestions = _suggest_tool_names(tool_name_for_suggestions)
+            suggestions = _suggest_tool_names(tool_name_for_suggestions, token)
             if suggestions:
-                err("  Did you mean: " + ", ".join(suggestions) + "?")
+                err("  Did you mean: " + ", ".join(_safe(s) for s in suggestions) + "?")
         if 400 <= e.code < 500:
             sys.exit(3 if e.code in (401, 403) else (2 if e.code in (400, 404) else 4))
         sys.exit(5)
@@ -308,10 +347,10 @@ def cmd_tools(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
             None,
         )
         if tool is None:
-            err(f"ERROR: '{target}' is not in this token's tool catalog.")
+            err(f"ERROR: '{_safe(target)}' is not in this token's tool catalog.")
             suggestions = _closest_names(target, tools_all)
             if suggestions:
-                err("  Did you mean: " + ", ".join(suggestions) + "?")
+                err("  Did you mean: " + ", ".join(_safe(s) for s in suggestions) + "?")
             sys.exit(2)
         emit(tool, explicit=args.output, pretty_renderer=_render_tool_detail)
         return
@@ -334,7 +373,8 @@ def cmd_tools(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
 
 def _closest_names(target: str, tools: list[dict]) -> list[str]:
     import difflib
-    return difflib.get_close_matches(target, [t["name"] for t in tools if "name" in t], n=3, cutoff=0.4)
+    names = [t["name"] for t in tools if isinstance(t.get("name"), str)]
+    return difflib.get_close_matches(target, names, n=3, cutoff=0.4)
 
 
 def cmd_tenant_use(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -349,11 +389,20 @@ def cmd_tenant_use(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         None,
     )
     if match is None:
-        err(f"ERROR: '{target}' is not a workspace this token reaches.")
+        err(f"ERROR: '{_safe(target)}' is not a workspace this token reaches.")
         err("  Run `uptonica whoami` to see what it can reach.")
         sys.exit(2)
-    _write_default_tenant(match["slug"])
-    banner(f"Default workspace set to {match['slug']} ({match.get('name', '')}).")
+    slug = match.get("slug")
+    # The match came from the SERVER's response, not from `target` — a
+    # workspace with no slug, or one that doesn't look like one, must not
+    # become the value later sent verbatim as the `X-Uptonica-Tenant` header
+    # on every subsequent call. This is defense in depth, not a real-world
+    # expectation: today every workspace has a slug.
+    if not isinstance(slug, str) or not TENANT_SLUG_RE.match(slug):
+        err(f"ERROR: the matched workspace has no usable slug ({slug!r}) — this looks like a server-side issue, not something to work around here.")
+        sys.exit(4)
+    _write_default_tenant(slug)
+    banner(f"Default workspace set to {slug} ({_safe(match.get('name', ''))}).")
 
 
 def cmd_tenant_show(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -372,7 +421,13 @@ def cmd_tenant_clear(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
 
 def cmd_call(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    tenant = _tenant(args)
+    tenant, tenant_source = _tenant_with_source(args)
+    if tenant_source == "default":
+        # The one source that isn't visible in the command as typed. A token
+        # that unions several client workspaces can have a stale default
+        # from a previous session; on a write, that's the wrong customer's
+        # data with no signal — this is the signal, cheap and always-on.
+        banner(f"[NOTE] using default workspace '{tenant}' (uptonica tenant use / --tenant to change)")
 
     if not TOOL_NAME_RE.match(args.tool):
         # Belt-and-braces: the server is the real boundary (it matches the
