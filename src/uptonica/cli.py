@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import math
 import os
@@ -26,7 +27,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 import re
 
@@ -154,6 +156,38 @@ def _clear_default_tenant() -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+# `ask` continues the last thread per workspace by default, the same way a
+# chat tab does — otherwise every follow-up ("sì", "e per il mese scorso?")
+# would need its own --conversation flag. One file per tenant, not one file
+# total: a token spanning several workspaces must not reply to yesterday's
+# "sì" against a DIFFERENT client's pending write.
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _conversation_state_path(tenant: str) -> Path:
+    # The tenant string here may be a --tenant flag value, which (unlike the
+    # stored default) is never validated against TENANT_SLUG_RE — an operator
+    # could type anything. A slug-shaped value gets a readable filename; any-
+    # thing else falls back to a hash, so this can never become a path outside
+    # config_dir() (no `..`, no `/`) regardless of what was typed.
+    safe = tenant if TENANT_SLUG_RE.match(tenant) else hashlib.sha256(tenant.encode("utf-8")).hexdigest()
+    return config_dir() / f"conversation_{safe}"
+
+
+def _read_last_conversation(tenant: str) -> str | None:
+    try:
+        raw = _conversation_state_path(tenant).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    if not raw or not UUID_RE.match(raw):
+        return None
+    return raw
+
+
+def _write_last_conversation(tenant: str, uuid: str) -> None:
+    atomic_write_text(_conversation_state_path(tenant), uuid.strip() + "\n", mode=0o600)
 
 
 def _tenant_with_source(args: argparse.Namespace) -> tuple[str | None, str | None]:
@@ -328,6 +362,123 @@ def _warn_if_deprecated(headers) -> None:
         banner(f"[DEPRECATION] {_safe(warning) if warning else 'This token will stop being accepted.'}")
         if sunset:
             banner(f"  Sunset: {_safe(sunset)} — re-mint a token at https://app.uptonica.com/account/api-tokens")
+
+
+def _iter_sse(response) -> Iterator[tuple[str, dict]]:
+    """Parse a `text/event-stream` body into `(event_type, data)` pairs.
+
+    Minimal on purpose: the server side ({@code SafeSSEAdapter}) only ever
+    writes one `event:` line and one `data:` line per event, so there is no
+    multi-line `data:` folding or `id:`/`retry:` handling to do here — a
+    general SSE client would be solving a problem this specific server
+    doesn't have.
+    """
+    event_type: str | None = None
+    data_line: str | None = None
+    while True:
+        raw = response.readline()
+        if not raw:
+            return
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if line == "":
+            if event_type is not None and data_line is not None:
+                try:
+                    yield event_type, json.loads(data_line)
+                except json.JSONDecodeError:
+                    pass
+            event_type = None
+            data_line = None
+            continue
+        if line.startswith("event:"):
+            event_type = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_line = line[len("data:"):].strip()
+
+
+def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    tenant, tenant_source = _tenant_with_source(args)
+    if tenant_source == "default":
+        banner(f"[NOTE] using default workspace '{tenant}' (uptonica tenant use / --tenant to change)")
+
+    conversation_uuid = args.conversation
+    if not conversation_uuid and not args.new and tenant:
+        conversation_uuid = _read_last_conversation(tenant)
+
+    body: dict[str, Any] = {"message": args.message}
+    if conversation_uuid:
+        body["conversation_uuid"] = conversation_uuid
+
+    token = _token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+        "User-Agent": f"uptonica-cli/{__version__}",
+    }
+    if tenant:
+        headers["X-Uptonica-Tenant"] = tenant
+
+    req = urllib.request.Request(
+        f"{API}/turns", data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
+    )
+
+    try:
+        # A generous read timeout: unlike every other endpoint this one runs
+        # an LLM turn (possibly several tool calls deep) before the first
+        # byte, not a bounded DB query.
+        response = _OPENER.open(req, timeout=300)
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            err(f"ERROR: the API tried to redirect this request to {e.headers.get('Location', '(unknown)')}.")
+            err("  Refusing to forward your token to a different host.")
+            sys.exit(4)
+        _warn_if_deprecated(e.headers)
+        raw_body = e.read().decode("utf-8", errors="replace")
+        detail = _safe(raw_body[:600])
+        try:
+            j = json.loads(raw_body)
+            detail = _safe(j.get("error_description") or j.get("error") or detail)
+        except (ValueError, TypeError):
+            pass
+        err(f"ERROR: HTTP {e.code} POST /turns\n  {detail}")
+        if 400 <= e.code < 500:
+            sys.exit(3 if e.code in (401, 403) else (2 if e.code in (400, 404) else 4))
+        sys.exit(5)
+    except urllib.error.URLError as e:
+        err(f"ERROR: network {API}/turns: {e}")
+        sys.exit(124)
+    except TimeoutError:
+        err(f"ERROR: timeout on {API}/turns")
+        sys.exit(124)
+
+    failed = False
+    with response:
+        _warn_if_deprecated(response.headers)
+        new_uuid = response.headers.get("X-Lia-Conversation")
+
+        for event_type, data in _iter_sse(response):
+            if event_type == "text_delta":
+                delta = data.get("delta")
+                if isinstance(delta, str):
+                    sys.stdout.write(_safe(delta))
+                    sys.stdout.flush()
+            elif event_type == "error":
+                failed = True
+                print()  # close whatever partial line was streaming
+                err(f"ERROR: {_safe(str(data.get('message', 'unknown error')))}")
+            elif event_type == "stream_end":
+                break
+
+    print()  # trailing newline after the streamed answer
+
+    # Persist the thread for the NEXT `ask` — including on a failed turn, so
+    # a mid-stream error doesn't silently start a fresh (unrelated) thread on
+    # the next try.
+    if tenant and isinstance(new_uuid, str) and UUID_RE.match(new_uuid):
+        _write_last_conversation(tenant, new_uuid)
+
+    if failed:
+        sys.exit(1)
 
 
 def cmd_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -640,6 +791,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  uptonica tenant use my-store\n"
             "  uptonica call catalog.stats.summary\n"
             "  uptonica tools --search contact\n"
+            "  uptonica ask \"quanto ho venduto questo mese?\"\n"
         ),
         parents=[output_parent],
     )
@@ -711,6 +863,30 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--confirm", metavar="TOKEN",
                      help="Resubmit after a confirmation_required response")
     sp.set_defaults(func=cmd_call)
+
+    sp = sub.add_parser(
+        "ask", help="Ask Lia in natural language — she picks the tool(s)",
+        description="Ask Lia in natural language instead of naming a tool yourself. Same engine,\n"
+                     "same per-tool permissions as chat and the mobile app — there is no separate\n"
+                     "tool allowlist to configure here.\n"
+                     "\n"
+                     "By default a workspace's conversation continues across calls, the same way\n"
+                     "a chat tab does: if Lia asks 'vuoi che proceda?', just run `uptonica ask "
+                     "\"sì\"` — Lia asks for explicit confirmation before any write, same as chat.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  uptonica ask \"quanto ho venduto questo mese?\" --tenant my-store\n"
+            "  uptonica ask \"aggiorna il prezzo del prodotto X a 19.90\"\n"
+            "  uptonica ask \"sì\"                       # confirms the pending write above\n"
+            "  uptonica ask \"...\" --new                 # start a fresh thread\n"
+        ),
+    )
+    sp.add_argument("message", help="What to ask Lia, in plain language")
+    sp.add_argument("--tenant", help="Workspace slug or id, if your token reaches more than one")
+    sp.add_argument("--conversation", metavar="UUID", help="Continue a specific thread instead of the last one")
+    sp.add_argument("--new", action="store_true", help="Start a new thread instead of continuing the last one")
+    sp.set_defaults(func=cmd_ask)
 
     cfg = sub.add_parser("config", help="Manage the stored token")
     cfg_sub = cfg.add_subparsers(dest="config_command", required=True, metavar="<command>")
