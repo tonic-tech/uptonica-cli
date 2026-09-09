@@ -1,1 +1,1 @@
-skills/uptonica-cli/SKILL.md
+plugins/uptonica/skills/uptonica-cli/SKILL.md
