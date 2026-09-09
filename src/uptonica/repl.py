@@ -19,6 +19,8 @@ import time
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -46,7 +48,10 @@ class _SlashCompleter(Completer):
     need a network round-trip on every keystroke. Out of scope for v1."""
 
     def get_completions(self, document, complete_event):  # noqa: ARG002
-        text = document.text_before_cursor
+        # current_line_before_cursor, not text_before_cursor: in multiline
+        # mode the buffer can hold earlier lines too, and a slash command is
+        # only ever meaningful as the whole of the CURRENT line.
+        text = document.current_line_before_cursor
         if not text.startswith("/") or " " in text:
             return
         for cmd in SLASH_COMMANDS:
@@ -78,6 +83,29 @@ def _history_path() -> str:
     return str(path)
 
 
+def _multiline_key_bindings() -> KeyBindings:
+    """Enter submits; Alt+Enter (or Esc then Enter — the same keystroke on a
+    terminal that can't tell the two apart, which is most of them) inserts a
+    newline instead. `PromptSession(multiline=True)` alone would give Enter
+    to the newline and leave nothing bound to submit, so both have to be
+    rebound together: Shift+Enter is deliberately NOT used for the newline
+    side, because most terminal emulators (unlike Kitty/iTerm2's opt-in
+    protocol) report it identically to a bare Enter — binding to it would
+    silently do nothing on those, with no way to tell the user why.
+    """
+    bindings = KeyBindings()
+
+    @bindings.add(Keys.Enter)
+    def _submit(event) -> None:  # noqa: ANN001
+        event.current_buffer.validate_and_handle()
+
+    @bindings.add(Keys.Escape, Keys.Enter)
+    def _newline(event) -> None:  # noqa: ANN001
+        event.current_buffer.insert_text("\n")
+
+    return bindings
+
+
 def run_repl(initial_tenant: str | None, initial_conversation: str | None) -> None:
     """Blocks until the user exits (Ctrl+D, `/exit`, `/quit`, or Ctrl+C at
     the prompt — mid-turn Ctrl+C is left to the normal KeyboardInterrupt
@@ -86,6 +114,8 @@ def run_repl(initial_tenant: str | None, initial_conversation: str | None) -> No
     session: PromptSession[str] = PromptSession(
         history=FileHistory(_history_path()),
         completer=_SlashCompleter(),
+        multiline=True,
+        key_bindings=_multiline_key_bindings(),
     )
 
     tenant = initial_tenant
@@ -129,12 +159,26 @@ def _prompt_label(tenant: str | None) -> str:
     return f"[{tenant or 'nessun workspace'}] > "
 
 
+# A single restrained glyph as Lia's mark, not an ASCII illustration: a
+# multi-line ASCII rendition of the U-arrow brand mark would depend on the
+# terminal's own font for alignment (box-drawing/line characters render at
+# different widths across terminal fonts) and risk looking broken rather
+# than distinctive. One character in the brand's lime accent is the same
+# restraint Claude Code's own "✻" mark uses, and degrades safely everywhere.
+_LIA_MARK = "✻"
+_LIME = "#c8f04f"
+
+
 def _print_banner(console: Console, tenant: str | None) -> None:
-    console.print(f"[bold]uptonica[/bold] v{__version__} — parla con Lia. /help per i comandi, Ctrl+D per uscire.")
+    console.print()
+    console.print(f"  [bold {_LIME}]{_LIA_MARK}[/bold {_LIME}]  [bold]Lia[/bold] — chiedimi qualsiasi cosa sul tuo workspace: vendite, catalogo, contatti, campagne.")
+    console.print(f"     uptonica v{__version__} · /help per i comandi · Ctrl+D per uscire")
+    console.print()
     if tenant:
-        console.print(f"workspace: [cyan]{escape(_safe(tenant))}[/cyan]")
+        console.print(f"  workspace: [cyan]{escape(_safe(tenant))}[/cyan]")
     else:
-        console.print("[yellow]nessun workspace selezionato[/yellow] — usa /workspace per sceglierne uno")
+        console.print("  [yellow]nessun workspace selezionato[/yellow] — usa /workspace per sceglierne uno")
+    console.print()
 
 
 def _handle_slash(text: str, console: Console, tenant: str | None):
@@ -170,7 +214,8 @@ def _print_help(console: Console) -> None:
         "  /help               questo elenco\n"
         "  /exit, /quit        esce (anche Ctrl+D)\n"
         "\n"
-        "qualsiasi altra riga è una domanda per Lia."
+        "qualsiasi altra riga è una domanda per Lia.\n"
+        "Invio invia; Option+Invio (Alt+Invio) va a capo senza inviare."
     )
 
 
@@ -226,6 +271,11 @@ def _switch_workspace(console: Console, arg: str):
     return (slug, None)
 
 
+# Matches the mockup's tool-status blue (distinct from the lime brand accent
+# and from the green/red success/failure colors, so a tool call reads as its
+# own category of line rather than competing with either).
+_TOOL_COLOR = "#6fb7d9"
+
 # Minimum interval between Markdown() re-parses of the accumulating reply.
 # Markdown.__init__ parses eagerly, so calling it once per SSE delta re-walks
 # the WHOLE reply so far every time — measured 11.3s of CPU for a 1000-delta,
@@ -253,6 +303,12 @@ def _send_turn(console: Console, tenant: str | None, message: str, conversation_
         if isinstance(header, str) and UUID_RE.match(header):
             new_uuid = header
 
+        # tool_id -> tool_name, so the tool_result event (which carries no
+        # name, only {tool_id, success, error} — see SafeSSEAdapter's own
+        # redaction of this event's real payload) can still say WHAT
+        # finished, not just that something did.
+        pending_tools: dict[str, str] = {}
+
         with Live(Markdown(""), console=console, refresh_per_second=12, vertical_overflow="visible") as live:
             last_render = 0.0
             try:
@@ -265,6 +321,27 @@ def _send_turn(console: Console, tenant: str | None, message: str, conversation_
                             if now - last_render >= _MARKDOWN_REFRESH_INTERVAL:
                                 live.update(Markdown(accumulated, hyperlinks=False))
                                 last_render = now
+                    elif event_type == "tool_call":
+                        tool_id = data.get("tool_id")
+                        tool_name = data.get("tool_name")
+                        if isinstance(tool_id, str) and isinstance(tool_name, str):
+                            pending_tools[tool_id] = tool_name
+                            # console.print() while a Live is active is
+                            # supported (rich suspends the live region,
+                            # prints above it, resumes) — this is a log
+                            # line, not something this Live tracks, since
+                            # each tool call needs its OWN line rather than
+                            # overwriting the one before it.
+                            console.print(f"  [{_TOOL_COLOR}]◐[/{_TOOL_COLOR}] {escape(_safe(tool_name))}...")
+                    elif event_type == "tool_result":
+                        tool_id = data.get("tool_id")
+                        name = pending_tools.pop(tool_id, tool_id) if isinstance(tool_id, str) else "?"
+                        if data.get("success", True):
+                            console.print(f"  [green]✓[/green] {escape(_safe(str(name)))}")
+                        else:
+                            error = data.get("error")
+                            suffix = f": {escape(_safe(str(error)))}" if error else ""
+                            console.print(f"  [red]✗[/red] {escape(_safe(str(name)))}{suffix}")
                     elif event_type == "error":
                         live.update(Markdown(accumulated, hyperlinks=False))
                         console.print(f"[red]ERRORE:[/red] {escape(_safe(str(data.get('message', 'unknown error'))))}")

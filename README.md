@@ -56,7 +56,10 @@ fresh thread, or `--conversation <uuid>` to pick a specific one.
 Run `uptonica` with no arguments (or `uptonica ask` with no message) to open
 an interactive session instead — one process for the whole conversation,
 with `/workspace` to list or switch workspaces, `/new` for a fresh thread,
-and `/help` for the rest. `Ctrl+D` exits.
+and `/help` for the rest. `Ctrl+D` exits. `Enter` sends a message;
+`Option+Enter` (`Alt+Enter`) starts a new line without sending. Every tool
+Lia calls shows up live (`◐ catalog.stats.summary...` → `✓`), so a slow
+answer never looks like it's just hung.
 
 ## For AI agents
 
