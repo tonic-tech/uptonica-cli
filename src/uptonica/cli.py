@@ -487,6 +487,14 @@ def _open_ask_stream(tenant: str | None, message: str, conversation_uuid: str | 
 
 
 def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    # Validated here, before the REPL branch below, not after it: --conversation
+    # is accepted by BOTH entry points (a one-shot ask AND `uptonica ask` with
+    # no message, to resume a specific thread in the REPL), so this must not
+    # live only in the one-shot path below it used to be the only one.
+    if args.conversation is not None and not UUID_RE.match(args.conversation):
+        err(f"ERROR: --conversation '{_safe(args.conversation)}' is not a UUID.")
+        sys.exit(2)
+
     if args.message is None:
         from uptonica.repl import run_repl  # deferred: prompt_toolkit/rich only needed for the REPL path
 
@@ -499,10 +507,6 @@ def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
 
     if len(args.message) > MAX_ASK_MESSAGE_LEN:
         err(f"ERROR: message is {len(args.message)} characters, over the {MAX_ASK_MESSAGE_LEN}-character limit.")
-        sys.exit(2)
-
-    if args.conversation is not None and not UUID_RE.match(args.conversation):
-        err(f"ERROR: --conversation '{_safe(args.conversation)}' is not a UUID.")
         sys.exit(2)
 
     tenant, tenant_source = _tenant_with_source(args)

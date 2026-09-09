@@ -7,8 +7,14 @@ requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Uptonica", email = "support@uptonica.com" }]
 dependencies = [
-    "prompt_toolkit>=3.0,<4.0",
+    "prompt_toolkit>=3.0.43,<4.0",
     "rich>=13.0,<15.0",
+    # rich's own floor (pygments>=2.13.0) resolves to a version with
+    # CVE-2022-40896 (ReDoS in Pygments lexers) on a constrained install.
+    # Reachable, not theoretical: rich.markdown.Markdown renders fenced code
+    # blocks through pygments, and what's being lexed there is the model's
+    # own reply — text ultimately derived from tenant data, not this CLI's.
+    "pygments>=2.15.0",
 ]
 
 [project.urls]

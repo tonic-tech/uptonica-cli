@@ -13,12 +13,16 @@ importing prompt_toolkit/rich at all.
 
 from __future__ import annotations
 
+import os
+import time
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape
 
 from uptonica.cli import (
     UUID_RE,
@@ -50,18 +54,37 @@ class _SlashCompleter(Completer):
                 yield Completion(cmd, start_position=-len(text))
 
 
+def _history_path() -> str:
+    """Pre-create the config dir and the history file at 0700/0600, rather
+    than letting `FileHistory` create them implicitly.
+
+    Two real bugs otherwise: `FileHistory` never creates its parent
+    directory, so on a fresh install where `config_dir()` doesn't exist yet
+    (Keychain-only token, no `tenant use` ever run) the REPL opens fine and
+    then crashes with FileNotFoundError the moment the user types a line.
+    And `FileHistory`'s own file creation is a plain `open(..., "ab")` —
+    0644 under a normal umask — for a file that logs every message typed
+    into an AI prompt, which routinely includes secrets a user is asking
+    Lia to use ("collega Shopify, la chiave è ..."). Every OTHER file this
+    package writes goes through `atomic_write_text` at 0600; this matches
+    that, by hand, since FileHistory doesn't take a mode argument.
+    """
+    directory = config_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = directory / "repl_history"
+    path.touch(mode=0o600, exist_ok=True)
+    os.chmod(path, 0o600)
+    return str(path)
+
+
 def run_repl(initial_tenant: str | None, initial_conversation: str | None) -> None:
     """Blocks until the user exits (Ctrl+D, `/exit`, `/quit`, or Ctrl+C at
     the prompt — mid-turn Ctrl+C is left to the normal KeyboardInterrupt
     path in main())."""
     console = Console(highlight=False)
-    # File-backed so arrow-up recalls earlier turns across sessions too, the
-    # same convenience `tenant use` gives the default workspace. 0600 via
-    # atomic_write_text elsewhere in this package is for secrets specifically;
-    # this file holds only the user's own typed messages, not credentials.
-    history_path = config_dir() / "repl_history"
     session: PromptSession[str] = PromptSession(
-        history=FileHistory(str(history_path)),
+        history=FileHistory(_history_path()),
         completer=_SlashCompleter(),
     )
 
@@ -99,13 +122,17 @@ _EXIT = object()  # sentinel distinct from "no state change" (None) and "new sta
 
 
 def _prompt_label(tenant: str | None) -> str:
+    # Passed to prompt_toolkit's session.prompt() as a plain string, which it
+    # renders literally (not through rich's markup parser, and not through
+    # any ANSI interpretation unless wrapped in HTML()/ANSI()) — so unlike
+    # every console.print() call below, this one needs no escaping.
     return f"[{tenant or 'nessun workspace'}] > "
 
 
 def _print_banner(console: Console, tenant: str | None) -> None:
     console.print(f"[bold]uptonica[/bold] v{__version__} — parla con Lia. /help per i comandi, Ctrl+D per uscire.")
     if tenant:
-        console.print(f"workspace: [cyan]{tenant}[/cyan]")
+        console.print(f"workspace: [cyan]{escape(tenant)}[/cyan]")
     else:
         console.print("[yellow]nessun workspace selezionato[/yellow] — usa /workspace per sceglierne uno")
 
@@ -126,7 +153,11 @@ def _handle_slash(text: str, console: Console, tenant: str | None):
     if cmd == "/workspace":
         return _switch_workspace(console, arg)
 
-    console.print(f"[red]comando sconosciuto:[/red] {_safe(cmd)} — /help per la lista")
+    # cmd is user-typed, not server-controlled — but escape() anyway rather
+    # than reason about which strings need it: it's a no-op on plain text
+    # and the one time this list grows a server-derived value, it's already
+    # covered rather than a bug waiting to be reintroduced.
+    console.print(f"[red]comando sconosciuto:[/red] {escape(_safe(cmd))} — /help per la lista")
     return None
 
 
@@ -146,12 +177,17 @@ def _print_help(console: Console) -> None:
 def _switch_workspace(console: Console, arg: str):
     try:
         data = _request("GET", "/whoami")
-    except SystemExit:
-        # _request() already printed its own ERROR/exit-coded message via
-        # err() before calling sys.exit() — that path is shared with every
-        # other command, and duplicating its error text here would just
-        # repeat it. The REPL survives a failed lookup; it does not survive
-        # sys.exit(), so it's caught rather than left to propagate.
+    except SystemExit as e:
+        # _request() -> _token() calls sys.exit(3) when there's no usable
+        # credential at all (CredentialError) — every OTHER command dies
+        # there too, and letting the REPL "recover" into a state where every
+        # future turn fails identically the same way is worse than exiting
+        # once with the real reason already printed by err() upstream. Any
+        # OTHER exit code (a 4xx/5xx from the whoami call itself, a network
+        # blip) is exactly what the REPL exists to survive, so only that one
+        # code is re-raised.
+        if e.code == 3:
+            raise
         return None
 
     tenants = data.get("tenants", [])
@@ -162,7 +198,9 @@ def _switch_workspace(console: Console, arg: str):
             return None
         console.print("[bold]workspace raggiungibili[/bold]")
         for t in tenants:
-            console.print(f"  {_safe(t.get('slug', '?'))}  {_safe(t.get('name', ''))}")
+            slug = escape(_safe(str(t.get("slug", "?"))))
+            name = escape(_safe(str(t.get("name", ""))))
+            console.print(f"  {slug}  {name}")
         return None
 
     match = next(
@@ -170,7 +208,7 @@ def _switch_workspace(console: Console, arg: str):
         None,
     )
     if match is None:
-        console.print(f"[red]'{_safe(arg)}' non è un workspace raggiungibile da questo token.[/red] /workspace per la lista")
+        console.print(f"[red]'{escape(_safe(arg))}' non è un workspace raggiungibile da questo token.[/red] /workspace per la lista")
         return None
 
     slug = match.get("slug")
@@ -178,7 +216,7 @@ def _switch_workspace(console: Console, arg: str):
         console.print("[red]il workspace trovato non ha uno slug utilizzabile — non dovrebbe succedere lato server.[/red]")
         return None
 
-    console.print(f"workspace: [cyan]{_safe(slug)}[/cyan] — nuovo thread")
+    console.print(f"workspace: [cyan]{escape(slug)}[/cyan] — nuovo thread")
     # A conversation UUID belongs to one tenant (see OperatorTurnController's
     # own pair check server-side); carrying the old one across a workspace
     # switch would just get refused as conversation_not_found on the next
@@ -186,11 +224,22 @@ def _switch_workspace(console: Console, arg: str):
     return (slug, None)
 
 
+# Minimum interval between Markdown() re-parses of the accumulating reply.
+# Markdown.__init__ parses eagerly, so calling it once per SSE delta re-walks
+# the WHOLE reply so far every time — measured 11.3s of CPU for a 1000-delta,
+# 70KB answer, independent of Live's own refresh_per_second (that throttles
+# the terminal redraw, not how often this constructs a new Markdown object
+# to hand it). This throttles the construction itself; the final state is
+# always flushed once more on stream_end/error so the visible answer is
+# never behind what was actually received.
+_MARKDOWN_REFRESH_INTERVAL = 1 / 12
+
+
 def _send_turn(console: Console, tenant: str | None, message: str, conversation_uuid: str | None) -> str | None:
     try:
         response = _open_ask_stream(tenant, message, conversation_uuid)
     except AskError as e:
-        console.print(f"[red]ERRORE:[/red] {_safe(str(e))}")
+        console.print(f"[red]ERRORE:[/red] {escape(_safe(str(e)))}")
         return conversation_uuid
 
     new_uuid = conversation_uuid
@@ -203,21 +252,29 @@ def _send_turn(console: Console, tenant: str | None, message: str, conversation_
             new_uuid = header
 
         with Live(Markdown(""), console=console, refresh_per_second=12, vertical_overflow="visible") as live:
+            last_render = 0.0
             try:
                 for event_type, data in _iter_sse(response):
                     if event_type == "text_delta":
                         delta = data.get("delta")
                         if isinstance(delta, str):
                             accumulated += _safe(delta)
-                            live.update(Markdown(accumulated))
+                            now = time.monotonic()
+                            if now - last_render >= _MARKDOWN_REFRESH_INTERVAL:
+                                live.update(Markdown(accumulated, hyperlinks=False))
+                                last_render = now
                     elif event_type == "error":
-                        live.update(Markdown(accumulated))
-                        console.print(f"[red]ERRORE:[/red] {_safe(str(data.get('message', 'unknown error')))}")
+                        live.update(Markdown(accumulated, hyperlinks=False))
+                        console.print(f"[red]ERRORE:[/red] {escape(_safe(str(data.get('message', 'unknown error'))))}")
                     elif event_type == "stream_end":
                         break
             except (OSError, TimeoutError) as e:
-                live.update(Markdown(accumulated))
-                console.print(f"[red]ERRORE:[/red] connessione persa: {_safe(str(e))}")
+                live.update(Markdown(accumulated, hyperlinks=False))
+                console.print(f"[red]ERRORE:[/red] connessione persa: {escape(_safe(str(e)))}")
+            else:
+                # Final flush: the throttle above may have left the last
+                # delta or two un-rendered even though they were received.
+                live.update(Markdown(accumulated, hyperlinks=False))
 
     # Persisted even after an error above: the server already committed
     # whatever it streamed before failing, and the next line in the REPL
