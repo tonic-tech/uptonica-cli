@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Uptonica", email = "support@uptonica.com" }]
-dependencies = []
+dependencies = [
+    "prompt_toolkit>=3.0,<4.0",
+    "rich>=13.0,<15.0",
+]
 
 [project.urls]
 Homepage = "https://uptonica.com"
