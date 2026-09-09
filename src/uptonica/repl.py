@@ -33,6 +33,7 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
+from textual.widget import MountError
 from textual.widgets import Markdown, Static, TextArea
 
 from uptonica.cli import (
@@ -302,6 +303,16 @@ _TOOL_COLOR = "#6fb7d9"
 # was actually received.
 _MARKDOWN_REFRESH_INTERVAL = 1 / 12
 
+# Shared between `_switch_workspace` and `_send_turn_blocking` — both are
+# "the credential this REPL is using just stopped working" (exit code 3,
+# _request()'s own auth/forbidden bucket), reached from two different
+# places (main thread vs. the turn's daemon thread), so the message the
+# user reads on the way out should be the same either way.
+_DEAD_TOKEN_MESSAGE = (
+    "Il token non è più valido (revocato o scaduto). "
+    "Rigeneralo qui: https://app.uptonica.com/account/api-tokens"
+)
+
 
 class ReplApp(App[None]):
     CSS = """
@@ -413,20 +424,32 @@ class ReplApp(App[None]):
         # doesn't mean the screen is still there to receive it — a turn's
         # daemon thread can call this (via `_add_error` etc.) after the app
         # has already started exiting (Ctrl+D, /exit, quitting mid-turn).
-        # `query_one` on a torn-down screen raises `NoMatches`, and an
-        # exception escaping a `call_from_thread`-dispatched callback hits
-        # Textual's OWN fatal-error renderer (`show_locals=True`) same as
-        # an unhandled worker exception would — the exact class of problem
-        # `_send_turn_blocking`'s backstop exists to prevent, just reached
-        # from a different direction. There's nothing useful to show once
-        # the screen is gone anyway, so this is a silent no-op, not a retry.
+        # And `on_print` can call this from a QUEUED `Print` message that
+        # was posted before `self.exit()` but only gets dispatched after —
+        # verified: a dead-token `/workspace` calling `self.exit()` right
+        # after `err()` printed the reason left exactly that queued message
+        # to arrive once `#history` was already detached, raising
+        # `MountError` (`is_attached` false), not `NoMatches` (`query_one`
+        # itself still found the widget — the app hadn't unmounted it from
+        # the tree yet, only detached it from the DOM `.mount()` checks).
+        # An exception escaping `on_print` specifically — a genuine message
+        # handler, not a `call_from_thread` call — hits Textual's OWN
+        # fatal-error renderer (`show_locals=True`), the exact class of
+        # problem `_send_turn_blocking`'s backstop exists to prevent for
+        # the worker-thread case, reached here from a different direction.
+        # (A `call_from_thread`-dispatched call raising the SAME exception
+        # would instead surface cleanly back on the calling thread — that
+        # backstop already covers it; this guard is specifically for the
+        # message-pump path, where nothing else catches it.) There's
+        # nothing useful to show once the screen is gone anyway, so this is
+        # a silent no-op, not a retry.
         try:
             history = self.query_one("#history", VerticalScroll)
-        except NoMatches:
+            widget = Static(renderable, classes=classes)
+            history.mount(widget)
+            history.scroll_end(animate=False)
+        except (NoMatches, MountError):
             return None
-        widget = Static(renderable, classes=classes)
-        history.mount(widget)
-        history.scroll_end(animate=False)
         return widget
 
     def _print_banner(self) -> None:
@@ -509,14 +532,40 @@ class ReplApp(App[None]):
         try:
             data = _request("GET", "/whoami")
         except SystemExit as e:
-            # exit(3) is _request()'s "auth/forbidden" bucket — the SAME
-            # token will fail the SAME way on the next turn too, so let a
-            # dead/revoked token exit the REPL once with the reason err()
-            # already printed, rather than loop on identical failures. Any
-            # OTHER exit code (network blip, 5xx) is exactly what the REPL
-            # exists to survive.
-            if e.code == 3:
-                raise
+            # exit(3) is _request()'s "auth/forbidden" bucket (401/403) —
+            # the SAME token will fail the SAME way on the next turn too,
+            # so this exits the REPL once instead of looping on identical
+            # failures. Any OTHER exit code (network blip, 5xx) is exactly
+            # what the REPL exists to survive, so only this one exits.
+            #
+            # NOT a bare `raise`: `_request()` already printed the reason
+            # via `err()`, captured into the transcript by `on_print()` —
+            # but the app is about to tear down its alt-screen, and a line
+            # mounted an instant before that never reaches the real
+            # terminal (verified: reproduced live on 2026-09-09, a dead
+            # token on `/workspace` closed the REPL with no visible
+            # message at all, while the exact same dead token on an
+            # ordinary question showed its error fine, since that path
+            # doesn't exit). `App.exit(message=...)` is Textual's own
+            # mechanism for a message that survives teardown — queued now,
+            # printed to the REAL terminal only once the screen is gone.
+            # `self.exit_code` is the same relay `run_repl()` already reads
+            # for a dead token hit from the turn thread (see
+            # `_send_turn_blocking`) — reused here since a bare `raise`
+            # would let the `SystemExit` cross Textual's own message-pump
+            # machinery uncaught, the same class of risk `_line()`/
+            # `_end_turn()`'s `NoMatches` guards exist to avoid elsewhere.
+            #
+            # `self.exit_code is None` guard: without it, a second
+            # `/workspace` landing in the window between this `exit()` call
+            # and teardown actually completing would hit this same branch
+            # again and queue a SECOND exit message — Textual then only
+            # prints the first and adds a "NOTE: 1 of 2 errors shown. Run
+            # with textual run --dev..." line, which is a jarring thing for
+            # an end user (not a developer) to read on their way out.
+            if e.code == 3 and self.exit_code is None:
+                self.exit_code = 3
+                self.exit(return_code=3, message=_DEAD_TOKEN_MESSAGE)
             return
 
         tenants = data.get("tenants", [])
@@ -653,7 +702,13 @@ class ReplApp(App[None]):
             # silently fail forever instead of exiting like `cmd_ask`'s
             # one-shot path does for the exact same error.
             self.exit_code = e.code if isinstance(e.code, int) else 1
-            self.call_from_thread(self.exit)
+            # Same message as `_switch_workspace`'s identical situation
+            # (see `_DEAD_TOKEN_MESSAGE`'s own comment) — the only
+            # `SystemExit` reachable from `_send_turn` is `_token()`'s own
+            # `sys.exit(3)`, so this is always that case. `call_from_thread`
+            # forwards kwargs, so `message=` reaches `self.exit()` the same
+            # way it would from a direct call.
+            self.call_from_thread(self.exit, return_code=self.exit_code, message=_DEAD_TOKEN_MESSAGE)
         except Exception as e:  # see docstring: this IS the backstop, on this thread
             if os.environ.get("UPTONICA_DEBUG") == "1":
                 raise
