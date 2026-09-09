@@ -78,5 +78,5 @@ need to clone anything to get that guidance loaded automatically:
 
 ## Status
 
-Actively developed — v0.2.0, built directly on the same tool API that powers
+Actively developed — v0.2.1, built directly on the same tool API that powers
 Uptonica's in-app assistant. See the repo issues for what's still open.
