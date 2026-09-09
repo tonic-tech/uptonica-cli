@@ -38,6 +38,13 @@ the same command with `--confirm <token>` within ~15 minutes to actually
 apply it. `--dry-run` previews a write without executing it. A tool name
 that doesn't exist gets a "did you mean" suggestion instead of a bare error.
 
+## For AI agents
+
+If you're an agent (Claude Code, Codex, or anything else) about to drive this
+CLI on someone's behalf, read [AGENTS.md](AGENTS.md) first — discovery order,
+how to handle a multi-workspace token, and the dry-run/confirm flow for
+writes.
+
 ## Status
 
 Early — v0.1.0, built against the existing Uptonica operator/tool API. See
