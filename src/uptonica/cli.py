@@ -496,7 +496,7 @@ def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         sys.exit(2)
 
     if args.message is None:
-        from uptonica.repl import run_repl  # deferred: prompt_toolkit/rich only needed for the REPL path
+        from uptonica.repl import run_repl  # deferred: textual is only needed for the REPL path
 
         tenant, _source = _tenant_with_source(args)
         conversation_uuid = args.conversation
