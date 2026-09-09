@@ -32,7 +32,6 @@ uptonica tools --search contact       # find a tool without scrolling the whole 
 uptonica tools --show catalog.product.get   # see its full description + parameters
 uptonica call catalog.stats.summary
 uptonica call crm.contact.create_task --arg title="Follow up" --arg priority=2
-uptonica ask "quanto ho venduto questo mese?"
 ```
 
 If your token reaches more than one workspace, `--tenant` on any command
@@ -42,16 +41,6 @@ A write tool that needs confirmation returns a `confirmation_token`; re-run
 the same command with `--confirm <token>` within ~15 minutes to actually
 apply it. `--dry-run` previews a write without executing it. A tool name
 that doesn't exist gets a "did you mean" suggestion instead of a bare error.
-
-## Ask in natural language
-
-`uptonica ask "<message>"` skips the tool catalog entirely — Lia (the same
-assistant behind chat and the mobile app) reads your request and picks the
-tool(s) herself, with the same per-tool permissions she already has
-everywhere else. A workspace's conversation continues across calls by
-default, so a follow-up like `uptonica ask "sì"` answers whatever Lia just
-asked (she always asks before a write, same as chat). Use `--new` to start a
-fresh thread, or `--conversation <uuid>` to pick a specific one.
 
 ## Status
 
