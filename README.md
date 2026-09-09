@@ -1,7 +1,11 @@
 # uptonica
 
-The Uptonica command-line client. One binary — what you can do is decided by
-the token you configure, not by which command you type.
+[![PyPI](https://img.shields.io/pypi/v/uptonica)](https://pypi.org/project/uptonica/)
+[![License](https://img.shields.io/pypi/l/uptonica)](https://github.com/tonic-tech/uptonica-cli/blob/main/LICENSE)
+
+The Uptonica command-line client for developers, agencies, and anyone
+automating their workspace — one binary, scope decided by the token you
+configure, not by which command you type.
 
 ## Install
 
@@ -55,5 +59,5 @@ need to clone anything to get that guidance loaded automatically:
 
 ## Status
 
-Early — v0.1.2, built against the existing Uptonica operator/tool API. See
-the repo issues for what's still open.
+Actively developed — v0.1.2, built directly on the same tool API that powers
+Uptonica's in-app assistant. See the repo issues for what's still open.
