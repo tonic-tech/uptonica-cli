@@ -53,6 +53,11 @@ default, so a follow-up like `uptonica ask "sì"` answers whatever Lia just
 asked (she always asks before a write, same as chat). Use `--new` to start a
 fresh thread, or `--conversation <uuid>` to pick a specific one.
 
+Run `uptonica` with no arguments (or `uptonica ask` with no message) to open
+an interactive session instead — one process for the whole conversation,
+with `/workspace` to list or switch workspaces, `/new` for a fresh thread,
+and `/help` for the rest. `Ctrl+D` exits.
+
 ## For AI agents
 
 If you're an agent (Claude Code, Codex, or anything else) about to drive this

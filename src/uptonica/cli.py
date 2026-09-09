@@ -416,24 +416,31 @@ def _iter_sse(response) -> Iterator[tuple[str, dict]]:
 MAX_ASK_MESSAGE_LEN = 10000  # mirrors the server's own `message` max:10000
 
 
-def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    if len(args.message) > MAX_ASK_MESSAGE_LEN:
-        err(f"ERROR: message is {len(args.message)} characters, over the {MAX_ASK_MESSAGE_LEN}-character limit.")
-        sys.exit(2)
+class AskError(Exception):
+    """A recoverable failure opening or reading an ask turn.
 
-    if args.conversation is not None and not UUID_RE.match(args.conversation):
-        err(f"ERROR: --conversation '{_safe(args.conversation)}' is not a UUID.")
-        sys.exit(2)
+    Deliberately NOT a `sys.exit()` at the point of failure, unlike every
+    other command in this file: `_open_ask_stream()` is shared between the
+    one-shot `ask` command (where exiting immediately is correct — there is
+    nothing left to run) and the interactive REPL (`uptonica.repl`), where a
+    failed turn must be reported and the session kept alive for the next one.
+    `exit_code` carries what `cmd_ask` would have called `sys.exit()` with,
+    so it doesn't have to re-derive it from the message.
+    """
 
-    tenant, tenant_source = _tenant_with_source(args)
-    if tenant_source == "default":
-        banner(f"[NOTE] using default workspace '{tenant}' (uptonica tenant use / --tenant to change)")
+    def __init__(self, message: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
-    conversation_uuid = args.conversation
-    if not conversation_uuid and not args.new and tenant:
-        conversation_uuid = _read_last_conversation(tenant)
 
-    body: dict[str, Any] = {"message": args.message}
+def _open_ask_stream(tenant: str | None, message: str, conversation_uuid: str | None):
+    """POST a turn to `/turns` and return the opened streaming response.
+
+    Raises `AskError` on any failure (never `sys.exit`s) — see `AskError` for
+    why. Callers still need to consume the body with `_iter_sse()` and close
+    it; this only covers "did the request even open".
+    """
+    body: dict[str, Any] = {"message": message}
     if conversation_uuid:
         body["conversation_uuid"] = conversation_uuid
 
@@ -455,12 +462,14 @@ def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         # A generous read timeout: unlike every other endpoint this one runs
         # an LLM turn (possibly several tool calls deep) before the first
         # byte, not a bounded DB query.
-        response = _OPENER.open(req, timeout=300)
+        return _OPENER.open(req, timeout=300)
     except urllib.error.HTTPError as e:
         if 300 <= e.code < 400:
-            err(f"ERROR: the API tried to redirect this request to {_safe(e.headers.get('Location', '(unknown)'))}.")
-            err("  Refusing to forward your token to a different host.")
-            sys.exit(4)
+            raise AskError(
+                f"the API tried to redirect this request to {_safe(e.headers.get('Location', '(unknown)'))}.\n"
+                "  Refusing to forward your token to a different host.",
+                exit_code=4,
+            ) from e
         _warn_if_deprecated(e.headers)
         raw_body = e.read().decode("utf-8", errors="replace")
         detail = _safe(raw_body[:600])
@@ -469,16 +478,50 @@ def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             detail = _safe(j.get("error_description") or j.get("error") or detail)
         except (ValueError, TypeError):
             pass
-        err(f"ERROR: HTTP {e.code} POST /turns\n  {detail}")
-        if 400 <= e.code < 500:
-            sys.exit(3 if e.code in (401, 403) else (2 if e.code in (400, 404) else 4))
-        sys.exit(5)
+        exit_code = 5 if e.code >= 500 else (3 if e.code in (401, 403) else (2 if e.code in (400, 404) else 4))
+        raise AskError(f"HTTP {e.code} POST /turns\n  {detail}", exit_code=exit_code) from e
     except urllib.error.URLError as e:
-        err(f"ERROR: network {API}/turns: {e}")
-        sys.exit(124)
-    except TimeoutError:
-        err(f"ERROR: timeout on {API}/turns")
-        sys.exit(124)
+        raise AskError(f"network {API}/turns: {e}", exit_code=124) from e
+    except TimeoutError as e:
+        raise AskError(f"timeout on {API}/turns", exit_code=124) from e
+
+
+def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    # Validated here, before the REPL branch below, not after it: --conversation
+    # is accepted by BOTH entry points (a one-shot ask AND `uptonica ask` with
+    # no message, to resume a specific thread in the REPL), so this must not
+    # live only in the one-shot path below it used to be the only one.
+    if args.conversation is not None and not UUID_RE.match(args.conversation):
+        err(f"ERROR: --conversation '{_safe(args.conversation)}' is not a UUID.")
+        sys.exit(2)
+
+    if args.message is None:
+        from uptonica.repl import run_repl  # deferred: prompt_toolkit/rich only needed for the REPL path
+
+        tenant, _source = _tenant_with_source(args)
+        conversation_uuid = args.conversation
+        if not conversation_uuid and not args.new and tenant:
+            conversation_uuid = _read_last_conversation(tenant)
+        run_repl(tenant, conversation_uuid)
+        return
+
+    if len(args.message) > MAX_ASK_MESSAGE_LEN:
+        err(f"ERROR: message is {len(args.message)} characters, over the {MAX_ASK_MESSAGE_LEN}-character limit.")
+        sys.exit(2)
+
+    tenant, tenant_source = _tenant_with_source(args)
+    if tenant_source == "default":
+        banner(f"[NOTE] using default workspace '{tenant}' (uptonica tenant use / --tenant to change)")
+
+    conversation_uuid = args.conversation
+    if not conversation_uuid and not args.new and tenant:
+        conversation_uuid = _read_last_conversation(tenant)
+
+    try:
+        response = _open_ask_stream(tenant, args.message, conversation_uuid)
+    except AskError as e:
+        err(f"ERROR: {e}")
+        sys.exit(e.exit_code)
 
     failed = False
     with response:
@@ -839,7 +882,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"uptonica {__version__}")
     # metavar hides argparse's default "{whoami,tools,call,config}" — that's
     # already spelled out, one per line with its own help text, right below.
-    sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
+    # NOT required: a bare `uptonica` (no subcommand at all) opens the same
+    # interactive session as `uptonica ask` with no message — see main()'s
+    # dispatch when args.command is None. Every other invocation shape keeps
+    # requiring one of the subcommands below.
+    sub = p.add_subparsers(dest="command", required=False, metavar="<command>")
 
     sp = sub.add_parser("whoami", help="Who this token is, and which workspace(s) it reaches",
                          parents=[output_parent])
@@ -921,9 +968,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "  uptonica ask \"aggiorna il prezzo del prodotto X a 19.90\"\n"
             "  uptonica ask \"sì\"                       # confirms the pending write above\n"
             "  uptonica ask \"...\" --new                 # start a fresh thread\n"
+            "  uptonica ask                             # no message: opens an interactive session\n"
         ),
     )
-    sp.add_argument("message", help="What to ask Lia, in plain language")
+    sp.add_argument("message", nargs="?", default=None, help="What to ask Lia. Omit to open an interactive session instead")
     sp.add_argument("--tenant", help="Workspace slug or id, if your token reaches more than one")
     sp.add_argument("--conversation", metavar="UUID", help="Continue a specific thread instead of the last one")
     sp.add_argument("--new", action="store_true", help="Start a new thread instead of continuing the last one")
@@ -950,6 +998,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        # Bare `uptonica` — same entry point as `uptonica ask` with no
+        # message, reusing cmd_ask's own dispatch to the REPL rather than
+        # duplicating it. Namespace built by hand: argparse never populated
+        # these because the `ask` subparser (which owns them) never ran.
+        args = argparse.Namespace(message=None, tenant=None, conversation=None, new=False, output=args.output)
+        args.func = cmd_ask
     try:
         args.func(args, parser)
     except SystemExit:
