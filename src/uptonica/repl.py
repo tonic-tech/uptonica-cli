@@ -18,6 +18,7 @@ import time
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
@@ -139,15 +140,19 @@ def run_repl(initial_tenant: str | None, initial_conversation: str | None) -> No
     tenant = initial_tenant
     conversation_uuid = initial_conversation
 
-    _print_banner(console, tenant)
+    _print_banner(console)
 
     while True:
+        _box_top(console, tenant)
         try:
-            text = session.prompt(_prompt_label(tenant))
+            text = session.prompt(_prompt_message(), prompt_continuation=_prompt_continuation)
         except EOFError:
+            _box_bottom(console)
             break
         except KeyboardInterrupt:
+            _box_bottom(console)
             continue  # Ctrl+C on an empty prompt clears the line, doesn't exit — matches most shells
+        _box_bottom(console)
 
         text = text.strip()
         if not text:
@@ -169,14 +174,6 @@ def run_repl(initial_tenant: str | None, initial_conversation: str | None) -> No
 _EXIT = object()  # sentinel distinct from "no state change" (None) and "new state" (tuple)
 
 
-def _prompt_label(tenant: str | None) -> str:
-    # Passed to prompt_toolkit's session.prompt() as a plain string, which it
-    # renders literally (not through rich's markup parser, and not through
-    # any ANSI interpretation unless wrapped in HTML()/ANSI()) — so unlike
-    # every console.print() call below, this one needs no escaping.
-    return f"[{tenant or 'nessun workspace'}] > "
-
-
 # A single restrained glyph as Lia's mark, not an ASCII illustration: a
 # multi-line ASCII rendition of the U-arrow brand mark would depend on the
 # terminal's own font for alignment (box-drawing/line characters render at
@@ -186,16 +183,60 @@ def _prompt_label(tenant: str | None) -> str:
 _LIA_MARK = "✻"
 _LIME = "#c8f04f"
 
+# Frames the input, top and bottom, on every turn — the approved mockup
+# (a boxed terminal window: titlebar, rounded border, a boxed input row)
+# was matched with the lightweight version of that idea rather than the
+# full one: a fixed border drawn fresh around each prompt instead of a
+# persistent full-screen frame with a pinned status bar, which would need
+# an alt-screen layout engine (rich's own screen isn't one) to keep a
+# border painted correctly across resizes and scrollback. "bright_black"
+# rather than a fixed hex: it's an ANSI SGR code the terminal's own theme
+# resolves, so the same border reads correctly on a light- or dark-background
+# terminal instead of picking one and looking wrong on the other — and it's
+# the one style name both rich (below) and prompt_toolkit's HTML() (in
+# _prompt_message/_prompt_continuation) can render identically, even though
+# they're two unrelated rendering engines drawing two halves of the same box.
+_BORDER_STYLE = "bright_black"
 
-def _print_banner(console: Console, tenant: str | None) -> None:
+
+def _box_top(console: Console, tenant: str | None) -> None:
+    if tenant:
+        label = escape(_safe_line(tenant))
+        colored = f"[cyan]{label}[/cyan]"
+    else:
+        label = "nessun workspace"
+        colored = f"[yellow]{label}[/yellow]"
+    # "  ╭─ " (5 cols) + label + " " (1 col) + dashes should fill the
+    # terminal width — sized here rather than left to wrap, since a wrapped
+    # border line looks broken rather than merely long.
+    dashes = "─" * max(console.size.width - 5 - len(label) - 1, 3)
+    console.print(f"  [{_BORDER_STYLE}]╭─[/{_BORDER_STYLE}] {colored} [{_BORDER_STYLE}]{dashes}[/{_BORDER_STYLE}]")
+
+
+def _box_bottom(console: Console) -> None:
+    dashes = "─" * max(console.size.width - 3, 3)
+    console.print(f"  [{_BORDER_STYLE}]╰{dashes}[/{_BORDER_STYLE}]")
+
+
+def _prompt_message() -> HTML:
+    # Rendered by prompt_toolkit itself, not rich — HTML() is prompt_toolkit's
+    # own markup, a different vocabulary from rich.markup.escape() used
+    # everywhere else in this file. No user- or server-controlled text
+    # passes through this string, so nothing here needs escaping.
+    return HTML(f'  <ansibrightblack>│</ansibrightblack> <style fg="{_LIME}">›</style> ')
+
+
+def _prompt_continuation(width: int, line_number: int, is_soft_wrap: bool) -> HTML:  # noqa: ARG001
+    # Same visible width as _prompt_message()'s "  │ › " (6 columns), so a
+    # second line of a multi-line message lines up under the first line's
+    # text instead of under the box's left border.
+    return HTML("  <ansibrightblack>│</ansibrightblack>   ")
+
+
+def _print_banner(console: Console) -> None:
     console.print()
     console.print(f"  [bold {_LIME}]{_LIA_MARK}[/bold {_LIME}]  [bold]Lia[/bold] — chiedimi qualsiasi cosa sul tuo workspace: vendite, catalogo, contatti, campagne.")
     console.print(f"     uptonica v{__version__} · /help per i comandi · Ctrl+D per uscire")
-    console.print()
-    if tenant:
-        console.print(f"  workspace: [cyan]{escape(_safe_line(tenant))}[/cyan]")
-    else:
-        console.print("  [yellow]nessun workspace selezionato[/yellow] — usa /workspace per sceglierne uno")
     console.print()
 
 
