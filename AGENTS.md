@@ -1,0 +1,1 @@
+plugins/uptonica/skills/uptonica-cli/SKILL.md
