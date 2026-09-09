@@ -7,14 +7,32 @@ requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Uptonica", email = "support@uptonica.com" }]
 dependencies = [
-    "prompt_toolkit>=3.0.43,<4.0",
-    "rich>=13.0,<15.0",
+    # The REPL's rendering engine — one compositor owns the whole screen
+    # (border, scroll, streaming markdown), replacing the rich+prompt_toolkit
+    # pair that used to draw two unrelated halves of the same box. Pulls in
+    # rich and pygments transitively, so the CVE note below still applies.
+    "textual>=8.0,<10.0",
     # rich's own floor (pygments>=2.13.0) resolves to a version with
     # CVE-2022-40896 (ReDoS in Pygments lexers) on a constrained install.
-    # Reachable, not theoretical: rich.markdown.Markdown renders fenced code
-    # blocks through pygments, and what's being lexed there is the model's
-    # own reply — text ultimately derived from tenant data, not this CLI's.
+    # Reachable, not theoretical: the REPL's streamed-answer widget renders
+    # fenced code blocks through pygments, and what's being lexed there is
+    # the model's own reply — text ultimately derived from tenant data, not
+    # this CLI's.
     "pygments>=2.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    # Only `tests/test_repl.py`'s own screen-capture helper imports this
+    # directly, to render a Textual screen to plain text for assertions —
+    # the package itself doesn't import rich anymore, textual pulls it in
+    # transitively. Declared explicitly here for the same reason the CLI
+    # doesn't rely on textual happening to vendor it: a direct `import`
+    # deserves a direct dependency, not a hope that someone else's pin
+    # keeps providing it.
+    "rich",
 ]
 
 [project.urls]
@@ -30,3 +48,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/uptonica"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
