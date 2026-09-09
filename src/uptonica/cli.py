@@ -129,7 +129,12 @@ DEFAULT_TENANT_PATH = config_dir() / "default_tenant"
 # standing hazard in every later one. This also bounds what can ever reach
 # `X-Uptonica-Tenant` from this path: no newlines, no header-folding
 # whitespace, no surprises.
-TENANT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+#
+# `\Z`, not `$` — `$` matches just before a trailing "\n" too, so
+# "my-store\n" would pass this as slug-shaped, take the readable-filename
+# branch in _conversation_state_path(), and only fail later with an
+# uncaught ValueError from http.client when it reaches a header.
+TENANT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}\Z")
 
 
 def _read_default_tenant() -> str | None:
@@ -306,7 +311,7 @@ def _request(method: str, path: str, *, json_body: dict | None = None,
             # _NoRedirect refused to follow it — surfaced here as an HTTPError
             # rather than silently falling through with no exit(), which
             # would have returned None to a caller expecting a dict.
-            err(f"ERROR: the API tried to redirect this request to {e.headers.get('Location', '(unknown)')}.")
+            err(f"ERROR: the API tried to redirect this request to {_safe(e.headers.get('Location', '(unknown)'))}.")
             err("  Refusing to forward your token to a different host. If this is expected "
                 "(e.g. a load balancer change), report it — this should not happen in normal use.")
             sys.exit(4)
@@ -373,19 +378,32 @@ def _iter_sse(response) -> Iterator[tuple[str, dict]]:
     general SSE client would be solving a problem this specific server
     doesn't have.
     """
+    # Bounded, not unlimited: a single endless line (malformed proxy, byte-fed
+    # stream with no "\n") would otherwise grow this process's memory forever
+    # regardless of the request timeout, since bytes are still arriving. A
+    # line hitting the cap is malformed SSE either way, so it is dropped as a
+    # protocol error rather than silently split into two fake events.
+    max_line = 1 << 20  # 1 MiB — generous for a single delta/data line
+
     event_type: str | None = None
     data_line: str | None = None
     while True:
-        raw = response.readline()
+        raw = response.readline(max_line)
         if not raw:
             return
+        if len(raw) >= max_line and not raw.endswith(b"\n"):
+            event_type = None
+            data_line = None
+            continue
         line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
         if line == "":
             if event_type is not None and data_line is not None:
                 try:
-                    yield event_type, json.loads(data_line)
+                    parsed = json.loads(data_line)
                 except json.JSONDecodeError:
-                    pass
+                    parsed = None
+                if isinstance(parsed, dict):
+                    yield event_type, parsed
             event_type = None
             data_line = None
             continue
@@ -395,7 +413,18 @@ def _iter_sse(response) -> Iterator[tuple[str, dict]]:
             data_line = line[len("data:"):].strip()
 
 
+MAX_ASK_MESSAGE_LEN = 10000  # mirrors the server's own `message` max:10000
+
+
 def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if len(args.message) > MAX_ASK_MESSAGE_LEN:
+        err(f"ERROR: message is {len(args.message)} characters, over the {MAX_ASK_MESSAGE_LEN}-character limit.")
+        sys.exit(2)
+
+    if args.conversation is not None and not UUID_RE.match(args.conversation):
+        err(f"ERROR: --conversation '{_safe(args.conversation)}' is not a UUID.")
+        sys.exit(2)
+
     tenant, tenant_source = _tenant_with_source(args)
     if tenant_source == "default":
         banner(f"[NOTE] using default workspace '{tenant}' (uptonica tenant use / --tenant to change)")
@@ -429,7 +458,7 @@ def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         response = _OPENER.open(req, timeout=300)
     except urllib.error.HTTPError as e:
         if 300 <= e.code < 400:
-            err(f"ERROR: the API tried to redirect this request to {e.headers.get('Location', '(unknown)')}.")
+            err(f"ERROR: the API tried to redirect this request to {_safe(e.headers.get('Location', '(unknown)'))}.")
             err("  Refusing to forward your token to a different host.")
             sys.exit(4)
         _warn_if_deprecated(e.headers)
@@ -456,18 +485,30 @@ def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         _warn_if_deprecated(response.headers)
         new_uuid = response.headers.get("X-Lia-Conversation")
 
-        for event_type, data in _iter_sse(response):
-            if event_type == "text_delta":
-                delta = data.get("delta")
-                if isinstance(delta, str):
-                    sys.stdout.write(_safe(delta))
-                    sys.stdout.flush()
-            elif event_type == "error":
-                failed = True
-                print()  # close whatever partial line was streaming
-                err(f"ERROR: {_safe(str(data.get('message', 'unknown error')))}")
-            elif event_type == "stream_end":
-                break
+        try:
+            for event_type, data in _iter_sse(response):
+                if event_type == "text_delta":
+                    delta = data.get("delta")
+                    if isinstance(delta, str):
+                        sys.stdout.write(_safe(delta))
+                        sys.stdout.flush()
+                elif event_type == "error":
+                    failed = True
+                    print()  # close whatever partial line was streaming
+                    err(f"ERROR: {_safe(str(data.get('message', 'unknown error')))}")
+                elif event_type == "stream_end":
+                    break
+        except (OSError, TimeoutError) as e:
+            # A dropped connection mid-stream (reset, incomplete read, a
+            # second read timeout after the first byte) — not an HTTPError,
+            # so it never touches the try/except above this block. Falls
+            # through to the SAME persist-the-thread step below: the server
+            # already committed whatever it streamed before dying, and the
+            # next `ask` should continue that thread, not silently orphan it
+            # by starting a fresh one.
+            failed = True
+            print()
+            err(f"ERROR: connection lost mid-stream: {e}")
 
     print()  # trailing newline after the streamed answer
 
