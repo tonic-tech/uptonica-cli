@@ -42,6 +42,24 @@ from uptonica.secrets import config_dir
 SLASH_COMMANDS = ["/workspace", "/new", "/help", "/exit", "/quit"]
 
 
+def _safe_line(s: object) -> str:
+    """`_safe()` for a value that is supposed to be ONE line — a tool name, a
+    tenant slug/name, a command word — never free-form diagnostic text.
+
+    `_safe()` alone keeps `\\n`: right for a streamed reply (real line
+    breaks) and for an error message (may genuinely span lines), wrong here.
+    A server-controlled "label" is exactly what `_safe()`'s own docstring
+    warns about forging a plausible status line with — `escape(_safe(...))`
+    stops it from being COLORED like a real `✓`/`✗` line, but `_safe()` on
+    its own still lets a tool_name or tenant name carrying `\\n✓ real.tool`
+    print as a second, uncolored-but-otherwise-convincing line. Folding
+    newlines/tabs to spaces here, before `escape()`, closes that — verified:
+    a tool_name containing "\\n  ✓ payments.refund.execute" now renders on
+    one line instead of forging a second.
+    """
+    return _safe(s).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+
+
 class _SlashCompleter(Completer):
     """Completes slash commands only — a line not starting with `/` is a
     message to Lia, and offering catalog/tool-name completion for THAT would
@@ -175,7 +193,7 @@ def _print_banner(console: Console, tenant: str | None) -> None:
     console.print(f"     uptonica v{__version__} · /help per i comandi · Ctrl+D per uscire")
     console.print()
     if tenant:
-        console.print(f"  workspace: [cyan]{escape(_safe(tenant))}[/cyan]")
+        console.print(f"  workspace: [cyan]{escape(_safe_line(tenant))}[/cyan]")
     else:
         console.print("  [yellow]nessun workspace selezionato[/yellow] — usa /workspace per sceglierne uno")
     console.print()
@@ -201,7 +219,7 @@ def _handle_slash(text: str, console: Console, tenant: str | None):
     # than reason about which strings need it: it's a no-op on plain text
     # and the one time this list grows a server-derived value, it's already
     # covered rather than a bug waiting to be reintroduced.
-    console.print(f"[red]comando sconosciuto:[/red] {escape(_safe(cmd))} — /help per la lista")
+    console.print(f"[red]comando sconosciuto:[/red] {escape(_safe_line(cmd))} — /help per la lista")
     return None
 
 
@@ -245,8 +263,8 @@ def _switch_workspace(console: Console, arg: str):
             return None
         console.print("[bold]workspace raggiungibili[/bold]")
         for t in tenants:
-            slug = escape(_safe(str(t.get("slug", "?"))))
-            name = escape(_safe(str(t.get("name", ""))))
+            slug = escape(_safe_line(str(t.get("slug", "?"))))
+            name = escape(_safe_line(str(t.get("name", ""))))
             console.print(f"  {slug}  {name}")
         return None
 
@@ -255,7 +273,7 @@ def _switch_workspace(console: Console, arg: str):
         None,
     )
     if match is None:
-        console.print(f"[red]'{escape(_safe(arg))}' non è un workspace raggiungibile da questo token.[/red] /workspace per la lista")
+        console.print(f"[red]'{escape(_safe_line(arg))}' non è un workspace raggiungibile da questo token.[/red] /workspace per la lista")
         return None
 
     slug = match.get("slug")
@@ -263,7 +281,7 @@ def _switch_workspace(console: Console, arg: str):
         console.print("[red]il workspace trovato non ha uno slug utilizzabile — non dovrebbe succedere lato server.[/red]")
         return None
 
-    console.print(f"workspace: [cyan]{escape(_safe(slug))}[/cyan] — nuovo thread")
+    console.print(f"workspace: [cyan]{escape(_safe_line(slug))}[/cyan] — nuovo thread")
     # A conversation UUID belongs to one tenant (see OperatorTurnController's
     # own pair check server-side); carrying the old one across a workspace
     # switch would just get refused as conversation_not_found on the next
@@ -332,16 +350,21 @@ def _send_turn(console: Console, tenant: str | None, message: str, conversation_
                             # line, not something this Live tracks, since
                             # each tool call needs its OWN line rather than
                             # overwriting the one before it.
-                            console.print(f"  [{_TOOL_COLOR}]◐[/{_TOOL_COLOR}] {escape(_safe(tool_name))}...")
+                            console.print(f"  [{_TOOL_COLOR}]◐[/{_TOOL_COLOR}] {escape(_safe_line(tool_name))}...")
                     elif event_type == "tool_result":
                         tool_id = data.get("tool_id")
                         name = pending_tools.pop(tool_id, tool_id) if isinstance(tool_id, str) else "?"
                         if data.get("success", True):
-                            console.print(f"  [green]✓[/green] {escape(_safe(str(name)))}")
+                            console.print(f"  [green]✓[/green] {escape(_safe_line(str(name)))}")
                         else:
+                            # error, unlike name/tool_name, is free-form
+                            # diagnostic text rather than a single-word
+                            # label — _safe() (newlines kept) is the right
+                            # tool here, matching the ERROR: prints below,
+                            # not _safe_line().
                             error = data.get("error")
                             suffix = f": {escape(_safe(str(error)))}" if error else ""
-                            console.print(f"  [red]✗[/red] {escape(_safe(str(name)))}{suffix}")
+                            console.print(f"  [red]✗[/red] {escape(_safe_line(str(name)))}{suffix}")
                     elif event_type == "error":
                         live.update(Markdown(accumulated, hyperlinks=False))
                         console.print(f"[red]ERRORE:[/red] {escape(_safe(str(data.get('message', 'unknown error'))))}")
