@@ -132,7 +132,7 @@ def _prompt_label(tenant: str | None) -> str:
 def _print_banner(console: Console, tenant: str | None) -> None:
     console.print(f"[bold]uptonica[/bold] v{__version__} — parla con Lia. /help per i comandi, Ctrl+D per uscire.")
     if tenant:
-        console.print(f"workspace: [cyan]{escape(tenant)}[/cyan]")
+        console.print(f"workspace: [cyan]{escape(_safe(tenant))}[/cyan]")
     else:
         console.print("[yellow]nessun workspace selezionato[/yellow] — usa /workspace per sceglierne uno")
 
@@ -178,14 +178,16 @@ def _switch_workspace(console: Console, arg: str):
     try:
         data = _request("GET", "/whoami")
     except SystemExit as e:
-        # _request() -> _token() calls sys.exit(3) when there's no usable
-        # credential at all (CredentialError) — every OTHER command dies
-        # there too, and letting the REPL "recover" into a state where every
-        # future turn fails identically the same way is worse than exiting
-        # once with the real reason already printed by err() upstream. Any
-        # OTHER exit code (a 4xx/5xx from the whoami call itself, a network
-        # blip) is exactly what the REPL exists to survive, so only that one
-        # code is re-raised.
+        # exit(3) is _request()'s "auth/forbidden" bucket (see the module
+        # docstring's exit-code table) — not just _token()'s own "no usable
+        # credential" CredentialError, but ALSO a 401/403 the server itself
+        # returned for this call. Every case in that bucket means the SAME
+        # token will fail the SAME way on the next turn too — a dead or
+        # revoked token, or one lacking the ability to reach /whoami at all
+        # — so letting the REPL "recover" into a loop of identical failures
+        # is worse than exiting once with the reason err() already printed
+        # upstream. A network blip or a 5xx (any OTHER exit code) is exactly
+        # what the REPL exists to survive, so only the auth bucket re-raises.
         if e.code == 3:
             raise
         return None
@@ -216,7 +218,7 @@ def _switch_workspace(console: Console, arg: str):
         console.print("[red]il workspace trovato non ha uno slug utilizzabile — non dovrebbe succedere lato server.[/red]")
         return None
 
-    console.print(f"workspace: [cyan]{escape(slug)}[/cyan] — nuovo thread")
+    console.print(f"workspace: [cyan]{escape(_safe(slug))}[/cyan] — nuovo thread")
     # A conversation UUID belongs to one tenant (see OperatorTurnController's
     # own pair check server-side); carrying the old one across a workspace
     # switch would just get refused as conversation_not_found on the next
