@@ -45,7 +45,15 @@ CLI on someone's behalf, read [AGENTS.md](AGENTS.md) first — discovery order,
 how to handle a multi-workspace token, and the dry-run/confirm flow for
 writes.
 
+**Claude Code users**: this repo is also a plugin marketplace, so you don't
+need to clone anything to get that guidance loaded automatically:
+
+```
+/plugin marketplace add tonic-tech/uptonica-cli
+/plugin install uptonica@uptonica-cli
+```
+
 ## Status
 
-Early — v0.1.0, built against the existing Uptonica operator/tool API. See
+Early — v0.1.2, built against the existing Uptonica operator/tool API. See
 the repo issues for what's still open.
