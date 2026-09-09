@@ -1,7 +1,7 @@
 {
   "name": "uptonica",
   "version": "0.1.2",
-  "description": "Teaches an AI coding agent to use the uptonica CLI correctly — discover-then-invoke, multi-workspace tenants, and per-tool dry-run/confirm semantics.",
+  "description": "Teaches an AI coding agent to use the uptonica CLI correctly — discover-then-invoke or ask in natural language, multi-workspace tenants, and per-tool dry-run/confirm semantics.",
   "author": {
     "name": "Uptonica"
   },

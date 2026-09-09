@@ -1,6 +1,6 @@
 ---
 name: uptonica-cli
-description: Use the `uptonica` command-line client to read or write data in a customer's Uptonica workspace from a terminal/agent context — discover the token's tool catalog, call a tool, handle a multi-workspace token, and confirm a write correctly. Use when a task needs to inspect or change Uptonica data (contacts, deals, quotes, catalog, ads, content), or when asked "what can uptonica do", "call an uptonica tool", "list my uptonica workspaces".
+description: Use the `uptonica` command-line client to read or write data in a customer's Uptonica workspace from a terminal/agent context — discover the token's tool catalog, call a tool or ask Lia in natural language, handle a multi-workspace token, and confirm a write correctly. Use when a task needs to inspect or change Uptonica data (contacts, deals, quotes, catalog, ads, content), or when asked "what can uptonica do", "call an uptonica tool", "ask uptonica", "list my uptonica workspaces".
 ---
 
 # Uptonica CLI
@@ -52,6 +52,54 @@ uptonica call <tool> [--tenant <slug|id>] --arg key=value [--arg key=value ...]
 - A `confirmation_token` (see Writes, below) must go through `--confirm`, not
   `--arg confirmation_token=...` or inside `--json` — both are rejected.
 
+## Asking in natural language — the simpler alternative to `call`
+
+```bash
+uptonica ask "quanto ho venduto questo mese?" --tenant my-store
+```
+
+For a task that doesn't need programmatic output, `ask` skips tool discovery
+entirely: Lia (the same engine behind chat and the mobile app) reads the
+message and picks the tool(s) herself. Prefer `ask` when you want an answer,
+not structured data to parse further — prefer `call` when you need JSON
+back, or need one specific tool to run and nothing else.
+
+- **Permission scope isn't confirmed to match a restricted token.** The
+  request carries only the bearer token + tenant header — the client code
+  doesn't show whether a read-only or area-scoped token actually constrains
+  what Lia can do through `ask` the way it constrains `call`. If you're
+  relying on a restricted token specifically to prevent certain actions,
+  don't assume `ask` respects that restriction until it's confirmed
+  server-side — prefer `call` for that case.
+- **Conversation continues by default, per workspace — but only once a
+  tenant actually resolves** (`--tenant`, `UPTONICA_TENANT`, or a stored
+  default). With none of those, nothing persists and nothing continues:
+  every call starts a fresh thread, silently. When a tenant does resolve, a
+  follow-up like `uptonica ask "sì"` answers whatever Lia just asked in the
+  *last* turn on that tenant — she always asks for explicit confirmation
+  before a write, the same way chat does. `--new` starts a fresh thread;
+  `--conversation <uuid>` picks a specific one (if you pass both, the
+  explicit `--conversation` silently wins over `--new`).
+- **The risk this creates**: switching to an unrelated task on the same
+  tenant without `--new` means a bare confirmation reply can land on a
+  stale pending write from an earlier, unrelated turn — pass `--new`
+  whenever the task changes, don't rely on remembering what the last turn
+  left pending.
+- **No `dry_run`/`confirmation_token`/`--confirm` here** — `ask` doesn't
+  take those flags at all. Confirmation for a write happens
+  conversationally (Lia asks in her reply; you answer in the next `ask`
+  call), not through the tool-level mechanism described under Writes,
+  below, which is `call`-specific.
+- **Output is plain streamed text, not JSON** — see Parsing output, below.
+- Tenant resolution is the same as `call` (`--tenant` → `UPTONICA_TENANT` →
+  stored default), including the same `[NOTE]` stderr line when it falls
+  back to a default.
+- Message cap: 10,000 characters.
+- **A failed turn (server-side error, or the connection dropping
+  mid-stream) exits `1`** — for `ask` specifically, that's a normal,
+  anticipated failure path, not the "the CLI didn't anticipate this"
+  backstop `1` means everywhere else in this doc. See Exit codes, below.
+
 ## Multi-workspace tokens: name the tenant
 
 A token can reach more than one workspace. Resolution for `call`, narrowest
@@ -63,7 +111,10 @@ somewhere the command line itself doesn't say. On anything that writes,
 prefer an explicit `--tenant` over trusting a default that may be stale from
 an earlier session or a different task.
 
-## Writes: most tools fire on the first call — check before you assume a safety net
+## Writes via `call`: most tools fire on the first call — check before you assume a safety net
+
+This section is about `call`. If you're using `ask` instead, its writes are
+confirmed conversationally — see the section above, not this one.
 
 **A write tool executes immediately by default.** `--dry-run` and confirmation
 are opt-in *per tool*, declared server-side — the CLI itself adds no gate of
@@ -97,11 +148,16 @@ every one of those you run programmatically. (The CLI already emits JSON
 automatically whenever stdout isn't a terminal — true for every subprocess
 call — but naming the flag makes the behavior explicit instead of depending
 on TTY detection nobody reading the command can see.) `tenant show`/`tenant
-use`/`tenant clear` and `config show`/`config set-token`/`config
-clear-token` do **not** take `--output` at all: `uptonica tenant show
---output json` fails with "unrecognized arguments", and `uptonica --output
-json tenant show` parses but is silently ignored. `config show` always
-prints JSON regardless; `tenant show` always prints a bare slug.
+use`/`tenant clear`, `config show`/`config set-token`/`config clear-token`,
+and `ask` do **not** take `--output` in the position right after the
+subcommand: `uptonica tenant show --output json` (or `uptonica ask "x"
+--output json`) fails with "unrecognized arguments". Put before the
+subcommand instead (`uptonica --output json tenant show` / `uptonica
+--output json ask "x"`), it parses — but is silently ignored either way.
+`config show` always prints JSON regardless; `tenant show` always prints a
+bare slug; `ask` always streams plain text (Lia's answer, token by token),
+never JSON, regardless of TTY. If you need something to parse
+programmatically, use `call`, not `ask`.
 
 Errors go to stderr with a plain `ERROR:` prefix. `[NOTE]`, `[WARNING]`,
 `[DEPRECATION]`, and `[WILL APPLY]` prefixes on stderr are all advisory, not
@@ -112,8 +168,17 @@ tenant not found · `3` auth — no token configured, or 401/403 (token
 invalid/expired, or it doesn't reach that workspace; only the latter is
 fixed by re-minting one, the former needs `uptonica config set-token`) ·
 `4` other 4xx or rate limit · `5` server error · `124` network/timeout ·
-`130` interrupted (Ctrl-C) · `1` unexpected/unhandled failure — this last one
-means something the CLI didn't anticipate, not a normal error path.
+`130` interrupted (Ctrl-C) · `1` unexpected/unhandled failure — everywhere
+except `ask`, this means something the CLI didn't anticipate, not a normal
+error path.
+
+**`ask` is the one exception to that `1`.** Once the response headers come
+back, `ask` reports every failure — a server-sent error mid-answer, or the
+connection dropping mid-stream — as exit `1`, not `124` or anything else.
+For `ask`, `1` is a normal, expected failure code, not just a backstop; the
+`2`/`3`/`4`/`5`/`124` codes above still apply, but only to failures before
+the stream starts (bad input, auth, network/timeout reaching the server at
+all).
 
 ## What NOT to do
 
@@ -126,3 +191,6 @@ means something the CLI didn't anticipate, not a normal error path.
   use `uptonica config set-token` interactively, or `--token-stdin`.
 - Don't assume a single-workspace token — check `whoami` before any
   cross-tenant-shaped task ("do this for all my workspaces").
+- Don't send an `ask` confirmation reply (e.g. `"sì"`) into a new, unrelated
+  task on the same tenant without `--new` first — it can confirm a stale
+  pending write from an earlier turn instead of doing nothing.
