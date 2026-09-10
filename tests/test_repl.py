@@ -35,14 +35,16 @@ def _isolated_config(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _restore_network_stubs():
-    """`_open_ask_stream`/`_iter_sse` get monkeypatched directly onto the
-    `repl` module by individual tests (they're imported by name into it) —
-    restore the real ones after each test so stubbing in one test can't
-    leak into the next."""
+    """`_open_ask_stream`/`_iter_sse`/`_request` get monkeypatched directly
+    onto the `repl` module by individual tests (they're imported by name
+    into it) — restore the real ones after each test so stubbing in one
+    test can't leak into the next."""
     original_stream = repl._open_ask_stream
     original_sse = repl._iter_sse
+    original_request = repl._request
     yield
     repl._open_ask_stream = original_stream
+    repl._request = original_request
     repl._iter_sse = original_sse
 
 
@@ -229,6 +231,76 @@ async def test_dead_token_exit_code_relayed():
         # were deleted and the app never closed at all.
         assert not app.is_running
         assert app.exit_code == 3
+
+
+async def test_dead_token_on_workspace_shows_message_before_exiting():
+    """Reported live on Termius, 2026-09-09: `/workspace` on a dead/revoked
+    token closed the REPL with NO visible message at all, while the exact
+    same dead token on an ordinary question showed its 401 error fine
+    (that path doesn't exit — see `test_dead_token_exit_code_relayed`).
+
+    Root cause: `_switch_workspace` used to `raise` the `SystemExit(3)`
+    straight through — `_request()`'s own `err()` call had already printed
+    the reason, captured into the transcript by `on_print()`, but the app
+    was already tearing down its alt-screen by the time that queued
+    message got dispatched, so it never reached the real terminal.
+    `App.exit(message=...)` is the fix: queued now, printed to the REAL
+    terminal only once the screen is actually gone.
+
+    A SECOND bug was found and fixed alongside it: `err()`'s `Print`
+    message (below, mirroring what the real `_request()` does before it
+    raises) can be POSTED before `self.exit()` runs but DISPATCHED after —
+    at which point `#history` is detached, and `_line()`'s `.mount()` call
+    raised `MountError`, not `NoMatches`. Calling `err()` here — not just
+    raising `SystemExit(3)` bare — is what actually exercises that path;
+    verified by reverting `_line()`'s `except (NoMatches, MountError)`
+    back to `except NoMatches` alone: this test fails with Textual's own
+    fatal-error renderer instead of a clean exit.
+    """
+
+    def dead_token_request(
+        method: str, path: str, *, json_body: dict | None = None,
+        tenant: str | None = None, timeout: int = 60,
+        tool_name_for_suggestions: str | None = None,
+    ):
+        # Mirrors `cli.py`'s own `_request()`: it prints the reason via
+        # `err()` BEFORE raising — that print is what's still in flight
+        # (queued, not yet dispatched) when `self.exit()` runs.
+        from uptonica.cli import err
+        err("ERROR: HTTP 401 GET /whoami\n  Operator token invalid or revoked.")
+        raise SystemExit(3)
+
+    repl._request = dead_token_request
+
+    app = repl.ReplApp(None, None)
+    exit_renderables_at_exit_call: list | None = None
+    real_exit = app.exit
+
+    def spy_exit(*a, **kw):
+        nonlocal exit_renderables_at_exit_call
+        real_exit(*a, **kw)
+        # Captured immediately after the call — Textual's own teardown
+        # prints and CLEARS `_exit_renderables`, so checking it after the
+        # `run_test()` block has exited would just see it already empty.
+        exit_renderables_at_exit_call = list(app._exit_renderables)
+
+    app.exit = spy_exit
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press(*list("/workspace"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not app.is_running:
+                break
+
+    assert not app.is_running
+    assert app.exit_code == 3
+    assert exit_renderables_at_exit_call, "exit() was called with no message queued — silent exit, the exact bug reported"
+    assert any("api-tokens" in str(r) for r in exit_renderables_at_exit_call), (
+        f"queued message doesn't look like the dead-token message: {exit_renderables_at_exit_call!r}"
+    )
 
 
 async def test_abort_turn():
