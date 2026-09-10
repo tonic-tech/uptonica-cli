@@ -47,7 +47,7 @@ from uptonica.secrets import (
     store_token,
 )
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 TOKEN_ENV_VAR = "UPTONICA_TOKEN"
 KEYCHAIN_ITEM = "uptonica-token"
 TOOL_NAME_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)*$")
