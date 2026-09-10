@@ -560,6 +560,22 @@ async def test_startup_skips_the_whoami_call_when_a_tenant_is_already_set():
         assert calls == []
 
 
+async def test_startup_auto_selects_the_only_reachable_workspace():
+    """Nothing to choose between — a single-workspace token used to print
+    a one-line "list" at startup and still leave `self.tenant` unset,
+    forcing the person to retype the one slug they were just shown before
+    they could ask anything. `on_mount`/`/workspace` (no argument) now pick
+    it automatically instead."""
+    repl._request = lambda *args, **kwargs: {"tenants": [{"slug": "acme", "name": "Acme"}], "tenant_count": 1}
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert app.tenant == "acme"
+        text = capture_text(app)
+        assert "workspace raggiungibili" not in text  # picked, not just listed
+        assert "acme" in text
+
+
 async def test_create_image_shortcut_composes_the_prompt():
     _stub_noop_turn()
     app = repl.ReplApp("acme", None)
@@ -672,6 +688,60 @@ async def test_login_slash_command_saves_the_token_and_prompts_for_a_workspace(m
         text = capture_text(app)
         assert "ABCD-EFGH" in text
         assert "workspace" in text.lower()
+
+
+async def test_login_auto_selects_the_only_workspace_the_new_token_reaches(monkeypatch):
+    """The other half of the "avoid logging in with no workspace" fix: a
+    `/login` that switches to a token reaching exactly one workspace picks
+    it right away, the same as the startup/`/workspace` case — not just
+    "old context dropped", also "new context set" whenever there's nothing
+    to actually choose between."""
+    monkeypatch.setattr(repl, "_device_login_flow", lambda no_browser, *, emit: "1|" + "a" * 24)
+    monkeypatch.setattr(repl, "store_token", lambda token: "macOS Keychain")
+    monkeypatch.setattr(repl, "_request", lambda *a, **k: {"tenants": [{"slug": "acme", "name": "Acme"}], "tenant_count": 1})
+
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#input")
+        await pilot.press(*list("/login"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert app.tenant == "acme"
+
+
+async def test_login_followup_whoami_failure_still_reenables_input(monkeypatch):
+    """Regression for a HIGH finding a security review caught: `_request`
+    only ever raises `SystemExit` for a response it recognized as an error
+    — a malformed 200 (wrong Content-Type, a captive-portal HTML page)
+    returns something that ISN'T the dict this code assumes, and `.get()`
+    on that is an `AttributeError` that used to escape the login thread
+    entirely. With `_end_turn` never reached, the input stayed disabled
+    forever — a valid login with a permanently dead REPL. This proves ANY
+    failure in the follow-up `/whoami` call still re-enables input."""
+    monkeypatch.setattr(repl, "_device_login_flow", lambda no_browser, *, emit: "1|" + "a" * 24)
+    monkeypatch.setattr(repl, "store_token", lambda token: "macOS Keychain")
+    # A string, not a dict — exactly the "wrong Content-Type" shape `_request`
+    # itself already returns for a non-JSON 200 (see cli.py:339-341).
+    monkeypatch.setattr(repl, "_request", lambda *a, **k: "<html>proxy error</html>")
+
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#input")
+        await pilot.press(*list("/login"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert not box.disabled, "input stayed disabled forever — the exact bug this test guards against"
+        assert app.is_running
 
 
 async def test_login_slash_command_no_browser_arg_is_passed_through(monkeypatch):
