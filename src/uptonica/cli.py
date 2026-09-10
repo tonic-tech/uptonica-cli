@@ -8,8 +8,9 @@ picked when you made it — including several client workspaces if you
 manage more than one (agencies get this automatically, scoped to the
 clients they actually manage).
 
-Get a token:  https://app.uptonica.com/account/api-tokens
-Store it:     uptonica config set-token
+Log in:       uptonica login
+(or mint a token yourself at https://app.uptonica.com/account/api-tokens,
+ then `uptonica config set-token`)
 
 Run `uptonica <command> --help` for details on a specific command.
 Exit codes: 0 ok | 2 usage error | 3 auth/forbidden | 4 4xx from the API | 5 5xx | 124 timeout
@@ -24,9 +25,11 @@ import json
 import math
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -367,6 +370,122 @@ def _warn_if_deprecated(headers) -> None:
         banner(f"[DEPRECATION] {_safe(warning) if warning else 'This token will stop being accepted.'}")
         if sunset:
             banner(f"  Sunset: {_safe(sunset)} — re-mint a token at https://app.uptonica.com/account/api-tokens")
+
+
+def _device_auth_request(path: str, json_body: dict | None = None) -> dict:
+    """POST to an unauthenticated `/oauth/device/*` endpoint — `login` runs
+    before a token exists, so there is no bearer to attach. An RFC 8628 error
+    response (`authorization_pending`, `slow_down`, `access_denied`,
+    `expired_token`) comes back as an ordinary 4xx JSON body and is returned
+    to the caller rather than turned into an exit() the way `_request` does
+    for the authenticated API — the polling loop in `cmd_login` needs to
+    branch on `error`, not stop on the first non-2xx response."""
+    url = f"{BASE}{path}"
+    headers = {"Accept": "application/json", "User-Agent": f"uptonica-cli/{__version__}"}
+    data = None
+    if json_body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(json_body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with _OPENER.open(req, timeout=15) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            err(f"ERROR: the login server tried to redirect this request to {_safe(e.headers.get('Location', '(unknown)'))}.")
+            err("  Refusing to follow it — this should not happen in normal use.")
+            sys.exit(4)
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(body)
+        except (ValueError, TypeError):
+            err(f"ERROR: HTTP {e.code} {path}\n  {_safe(body[:600])}")
+            sys.exit(5 if e.code >= 500 else 4)
+    except urllib.error.URLError as e:
+        err(f"ERROR: network {url}: {e}")
+        sys.exit(124)
+    except TimeoutError:
+        err(f"ERROR: timeout on {url}")
+        sys.exit(124)
+
+
+def cmd_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    start = _device_auth_request("/oauth/device/code", json_body={})
+    device_code = start.get("device_code")
+    # `_safe()` on every field the server hands back before it reaches the
+    # terminal (banner/print) or a browser open — same reasoning as `_safe`'s
+    # own docstring: this response is unauthenticated (there is no token yet
+    # to prove it came from a session we trust), so it gets the same
+    # control-character stripping as any other server-derived string, not an
+    # exemption for being part of the login path itself.
+    user_code = _safe(start.get("user_code") or "")
+    verification_uri = _safe(start.get("verification_uri") or "")
+    verification_uri_complete = _safe(start.get("verification_uri_complete") or start.get("verification_uri") or "")
+    if not device_code or not user_code or not verification_uri:
+        err(f"ERROR: unexpected response starting login: {_safe(json.dumps(start))}")
+        sys.exit(5)
+    try:
+        # Clamped, not just parsed: this is the server telling the CLI how to
+        # pace itself, and a malformed or hostile value (0, negative, a
+        # multi-year expiry) must not turn into a sleepless hammering loop or
+        # a client that appears to hang forever. `is None` rather than `or`
+        # for the default — 0 is a real (if hostile) value the clamp below
+        # must still see, not something to treat the same as absent.
+        interval_raw = start.get("interval")
+        expires_raw = start.get("expires_in")
+        interval = max(1, min(int(5 if interval_raw is None else interval_raw), 60))
+        expires_in = max(60, min(int(600 if expires_raw is None else expires_raw), 1800))
+    except (TypeError, ValueError):
+        err(f"ERROR: unexpected response starting login: {_safe(json.dumps(start))}")
+        sys.exit(5)
+
+    banner(f"Confirm this code in your browser: {user_code}")
+    if args.no_browser:
+        banner(f"Visit {verification_uri} and enter the code above.")
+    else:
+        banner(f"Opening {verification_uri_complete} ...")
+        try:
+            webbrowser.open(verification_uri_complete)
+        except Exception:
+            pass
+        banner(f"If it didn't open, visit {verification_uri} and enter the code above.")
+
+    deadline = time.monotonic() + expires_in
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        result = _device_auth_request("/oauth/device/token", json_body={"device_code": device_code})
+        token = result.get("access_token")
+        if token:
+            if not looks_like_sanctum_token(token):
+                err("ERROR: the server returned something that doesn't look like an Uptonica token — not saving it.")
+                sys.exit(5)
+            where = store_token(token)
+            banner(f"Saved to {where}.")
+            if os.environ.get(TOKEN_ENV_VAR):
+                banner(f"[WARNING] {TOKEN_ENV_VAR} is set in this shell and takes priority over what was just "
+                       f"saved — unset it if you want the new token to actually be used.")
+            banner("Verifying...")
+            data = _request("GET", "/whoami")
+            n = data.get("tenant_count", 0)
+            banner(f"Logged in — this token reaches {n} workspace{'s' if n != 1 else ''}.")
+            return
+        error = result.get("error")
+        if error == "slow_down":
+            interval = min(interval + 5, 60)
+        elif error == "authorization_pending":
+            pass
+        elif error == "access_denied":
+            err("ERROR: login was denied in the browser.")
+            sys.exit(3)
+        elif error == "expired_token":
+            err("ERROR: this login code expired — run `uptonica login` again.")
+            sys.exit(3)
+        else:
+            err(f"ERROR: unexpected response while waiting for login: {_safe(json.dumps(result))}")
+            sys.exit(5)
+
+    err("ERROR: this login code expired — run `uptonica login` again.")
+    sys.exit(3)
 
 
 def _iter_sse(response) -> Iterator[tuple[str, dict]]:
@@ -871,6 +990,7 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
+            "  uptonica login\n"
             "  uptonica whoami\n"
             "  uptonica tenant use my-store\n"
             "  uptonica call catalog.stats.summary\n"
@@ -976,6 +1096,19 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--conversation", metavar="UUID", help="Continue a specific thread instead of the last one")
     sp.add_argument("--new", action="store_true", help="Start a new thread instead of continuing the last one")
     sp.set_defaults(func=cmd_ask)
+
+    sp = sub.add_parser(
+        "login", help="Log in via your browser and store the token (no copy-paste)",
+        epilog=(
+            "examples:\n"
+            "  uptonica login\n"
+            "  uptonica login --no-browser   # print the URL instead of opening it\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument("--no-browser", action="store_true", dest="no_browser",
+                     help="Don't try to open a browser automatically — just print the URL and code")
+    sp.set_defaults(func=cmd_login)
 
     cfg = sub.add_parser("config", help="Manage the stored token")
     cfg_sub = cfg.add_subparsers(dest="config_command", required=True, metavar="<command>")

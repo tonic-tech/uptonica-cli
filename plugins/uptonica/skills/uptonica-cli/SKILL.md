@@ -166,7 +166,9 @@ a failure.
 Exit codes, if you're branching on them: `0` ok · `2` bad input, or tool/
 tenant not found · `3` auth — no token configured, or 401/403 (token
 invalid/expired, or it doesn't reach that workspace; only the latter is
-fixed by re-minting one, the former needs `uptonica config set-token`) ·
+fixed by re-minting one, the former needs a human to run `uptonica login`
+— a browser-based flow, not something to script — or `uptonica config
+set-token` with one minted by hand) ·
 `4` other 4xx or rate limit · `5` server error · `124` network/timeout ·
 `130` interrupted (Ctrl-C) · `1` unexpected/unhandled failure — everywhere
 except `ask`, this means something the CLI didn't anticipate, not a normal
