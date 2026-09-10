@@ -219,6 +219,26 @@ def test_login_malformed_start_response_exits_5(monkeypatch, capsys):
     assert "unexpected response starting login" in capsys.readouterr().err
 
 
+def test_login_redacts_device_code_from_a_hostile_interval_error(monkeypatch, capsys):
+    """A security review caught this: `device_code` is the sole bearer
+    credential for the unauthenticated device-token poll, and in the REPL
+    this exact error text lands in the on-screen transcript, not just
+    stderr. A malformed `interval`/`expires_in` alongside an otherwise-valid
+    device_code must not be what puts it there."""
+    monkeypatch.setattr(cli, "_device_auth_request", lambda path, json_body=None: (
+        _start_response(device_code="dc-secret-987", interval="not a number")
+    ))
+
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_login(_args(), parser=None)
+
+    assert exc.value.code == 5
+    err = capsys.readouterr().err
+    assert "unexpected response starting login" in err
+    assert "dc-secret-987" not in err
+    assert "[redacted]" in err
+
+
 def test_login_rejects_a_malformed_access_token_without_storing_it(monkeypatch, capsys):
     stored = []
     monkeypatch.setattr(cli, "store_token", lambda value: stored.append(value) or "macOS Keychain")

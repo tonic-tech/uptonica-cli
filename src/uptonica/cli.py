@@ -9,6 +9,7 @@ manage more than one (agencies get this automatically, scoped to the
 clients they actually manage).
 
 Log in:       uptonica login
+Log out:      uptonica logout
 (or mint a token yourself at https://app.uptonica.com/account/api-tokens,
  then `uptonica config set-token`)
 
@@ -287,6 +288,35 @@ def _suggest_tool_names(bad_name: str, token: str) -> list[str]:
         return []
 
 
+# Maps a handful of well-known machine-readable `error` codes the operator
+# API returns (see e.g. `OperatorTurnController`/`OperatorToolController` on
+# the server) to a hint phrased in terms of what THIS CLI can do about it,
+# appended after the server's own `error_description`. Without this, a
+# person reading the error sees the server's own instructions verbatim —
+# "Call /api/v1/operator/whoami for the list", a raw API path, not
+# `uptonica whoami` — which is accurate but not something a CLI user should
+# have to translate themselves. Keyed by `error`, not matched against the
+# description text, so a wording change on the server side can't silently
+# stop the hint from firing.
+_ERROR_HINTS: dict[str, str] = {
+    "tenant_required": "Run `uptonica whoami` to see your workspaces, then `uptonica tenant use <slug>` "
+                        "to set a default (or pass `--tenant <slug>` just this once; inside the REPL, `/workspace <slug>`).",
+    "insufficient_scope": "`ask`/the REPL need an unrestricted, write-capable token — mint one without an "
+                           "`area:` scope via `uptonica login`, or use `uptonica call <tool>` with the scoped token you already have.",
+    "conversation_not_found": "That thread is gone server-side — the next `ask`/REPL message in this workspace "
+                               "starts a fresh one automatically; pass `--new` (or `/new` in the REPL) to do that explicitly.",
+    "budget_exhausted": "Nothing to do from here — this resets monthly, or an admin can raise the limit "
+                         "under Settings -> Billing on the workspace.",
+    "rate_limited": "Wait a few seconds and try again.",
+}
+
+
+def _hint_for_error(error_code: object) -> str | None:
+    if not isinstance(error_code, str):
+        return None
+    return _ERROR_HINTS.get(error_code)
+
+
 def _request(method: str, path: str, *, json_body: dict | None = None,
               tenant: str | None = None, timeout: int = 60,
               tool_name_for_suggestions: str | None = None) -> Any:
@@ -337,6 +367,9 @@ def _request(method: str, path: str, *, json_body: dict | None = None,
             suggestions = _suggest_tool_names(tool_name_for_suggestions, token)
             if suggestions:
                 err("  Did you mean: " + ", ".join(_safe(s) for s in suggestions) + "?")
+        hint = _hint_for_error(j.get("error") if isinstance(j, dict) else None)
+        if hint:
+            err(f"  {hint}")
         if 400 <= e.code < 500:
             sys.exit(3 if e.code in (401, 403) else (2 if e.code in (400, 404) else 4))
         sys.exit(5)
@@ -409,7 +442,28 @@ def _device_auth_request(path: str, json_body: dict | None = None) -> dict:
         sys.exit(124)
 
 
-def cmd_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+class DeviceLoginError(Exception):
+    """A terminal failure of the device-authorization flow.
+
+    Raised by `_device_login_flow`, never a bare `sys.exit()` — that
+    function is shared between the one-shot `uptonica login` (where exiting
+    is correct, same as `AskError`'s reasoning) and the REPL's `/login`
+    (which must report the failure and keep the session alive, not tear
+    down the process). `cli_exit_code` is what the top-level command exits
+    with; the REPL just prints the message and re-enables input."""
+
+    def __init__(self, message: str, cli_exit_code: int) -> None:
+        super().__init__(message)
+        self.cli_exit_code = cli_exit_code
+
+
+def _device_login_flow(no_browser: bool, *, emit) -> str:
+    """Drives the RFC 8628 device-authorization flow to completion and
+    returns the minted token. `emit(line)` is called for every user-facing
+    status line as it happens (the code to confirm, where it opened, etc.)
+    — the top-level command routes it through `banner()`, the REPL through
+    its own transcript — so this function has no idea which UI is driving
+    it and never touches stdout/stderr or `sys.exit()` directly."""
     start = _device_auth_request("/oauth/device/code", json_body={})
     device_code = start.get("device_code")
     # `_safe()` on every field the server hands back before it reaches the
@@ -421,9 +475,15 @@ def cmd_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
     user_code = _safe(start.get("user_code") or "")
     verification_uri = _safe(start.get("verification_uri") or "")
     verification_uri_complete = _safe(start.get("verification_uri_complete") or start.get("verification_uri") or "")
+    # Redacted before it ever reaches a DeviceLoginError message: `device_code`
+    # is the sole bearer credential for the unauthenticated `/oauth/device/token`
+    # poll (same reasoning as DeviceApproval's own docblock server-side), and
+    # in the REPL a DeviceLoginError's text lands in the on-screen transcript,
+    # not just stderr — a malformed `interval`/`expires_in` alongside an
+    # otherwise-valid device_code must not be the thing that puts it there.
+    _debug_payload = _safe(json.dumps({**start, "device_code": "[redacted]"} if device_code else start))
     if not device_code or not user_code or not verification_uri:
-        err(f"ERROR: unexpected response starting login: {_safe(json.dumps(start))}")
-        sys.exit(5)
+        raise DeviceLoginError(f"unexpected response starting login: {_debug_payload}", 5)
     try:
         # Clamped, not just parsed: this is the server telling the CLI how to
         # pace itself, and a malformed or hostile value (0, negative, a
@@ -436,19 +496,18 @@ def cmd_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
         interval = max(1, min(int(5 if interval_raw is None else interval_raw), 60))
         expires_in = max(60, min(int(600 if expires_raw is None else expires_raw), 1800))
     except (TypeError, ValueError):
-        err(f"ERROR: unexpected response starting login: {_safe(json.dumps(start))}")
-        sys.exit(5)
+        raise DeviceLoginError(f"unexpected response starting login: {_debug_payload}", 5) from None
 
-    banner(f"Confirm this code in your browser: {user_code}")
-    if args.no_browser:
-        banner(f"Visit {verification_uri} and enter the code above.")
+    emit(f"Confirm this code in your browser: {user_code}")
+    if no_browser:
+        emit(f"Visit {verification_uri} and enter the code above.")
     else:
-        banner(f"Opening {verification_uri_complete} ...")
+        emit(f"Opening {verification_uri_complete} ...")
         try:
             webbrowser.open(verification_uri_complete)
         except Exception:
             pass
-        banner(f"If it didn't open, visit {verification_uri} and enter the code above.")
+        emit(f"If it didn't open, visit {verification_uri} and enter the code above.")
 
     deadline = time.monotonic() + expires_in
     while time.monotonic() < deadline:
@@ -457,35 +516,47 @@ def cmd_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
         token = result.get("access_token")
         if token:
             if not looks_like_sanctum_token(token):
-                err("ERROR: the server returned something that doesn't look like an Uptonica token — not saving it.")
-                sys.exit(5)
-            where = store_token(token)
-            banner(f"Saved to {where}.")
-            if os.environ.get(TOKEN_ENV_VAR):
-                banner(f"[WARNING] {TOKEN_ENV_VAR} is set in this shell and takes priority over what was just "
-                       f"saved — unset it if you want the new token to actually be used.")
-            banner("Verifying...")
-            data = _request("GET", "/whoami")
-            n = data.get("tenant_count", 0)
-            banner(f"Logged in — this token reaches {n} workspace{'s' if n != 1 else ''}.")
-            return
+                raise DeviceLoginError("the server returned something that doesn't look like an Uptonica token — not saving it.", 5)
+            return token
         error = result.get("error")
         if error == "slow_down":
             interval = min(interval + 5, 60)
         elif error == "authorization_pending":
             pass
         elif error == "access_denied":
-            err("ERROR: login was denied in the browser.")
-            sys.exit(3)
+            raise DeviceLoginError("login was denied in the browser.", 3)
         elif error == "expired_token":
-            err("ERROR: this login code expired — run `uptonica login` again.")
-            sys.exit(3)
+            raise DeviceLoginError("this login code expired — run `uptonica login` again.", 3)
         else:
-            err(f"ERROR: unexpected response while waiting for login: {_safe(json.dumps(result))}")
-            sys.exit(5)
+            raise DeviceLoginError(f"unexpected response while waiting for login: {_safe(json.dumps(result))}", 5)
 
-    err("ERROR: this login code expired — run `uptonica login` again.")
-    sys.exit(3)
+    raise DeviceLoginError("this login code expired — run `uptonica login` again.", 3)
+
+
+def cmd_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    try:
+        token = _device_login_flow(args.no_browser, emit=banner)
+    except DeviceLoginError as e:
+        err(f"ERROR: {e}")
+        sys.exit(e.cli_exit_code)
+
+    where = store_token(token)
+    banner(f"Saved to {where}.")
+    if os.environ.get(TOKEN_ENV_VAR):
+        banner(f"[WARNING] {TOKEN_ENV_VAR} is set in this shell and takes priority over what was just "
+               f"saved — unset it if you want the new token to actually be used.")
+    banner("Verifying...")
+    data = _request("GET", "/whoami")
+    n = data.get("tenant_count", 0)
+    banner(f"Logged in — this token reaches {n} workspace{'s' if n != 1 else ''}.")
+
+
+def cmd_logout(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Top-level alias for `config clear-token` — same removal, but under
+    the name someone reaching for the counterpart of `uptonica login` will
+    actually type. Kept as a thin wrapper (not a duplicate) so the two never
+    drift: see `cmd_config_clear_token` for the actual behavior."""
+    cmd_config_clear_token(args, parser)
 
 
 def _iter_sse(response) -> Iterator[tuple[str, dict]]:
@@ -592,11 +663,16 @@ def _open_ask_stream(tenant: str | None, message: str, conversation_uuid: str | 
         _warn_if_deprecated(e.headers)
         raw_body = e.read().decode("utf-8", errors="replace")
         detail = _safe(raw_body[:600])
+        error_code = None
         try:
             j = json.loads(raw_body)
-            detail = _safe(j.get("error_description") or j.get("error") or detail)
+            error_code = j.get("error")
+            detail = _safe(j.get("error_description") or error_code or detail)
         except (ValueError, TypeError):
             pass
+        hint = _hint_for_error(error_code)
+        if hint:
+            detail = f"{detail}\n  {hint}"
         exit_code = 5 if e.code >= 500 else (3 if e.code in (401, 403) else (2 if e.code in (400, 404) else 4))
         raise AskError(f"HTTP {e.code} POST /turns\n  {detail}", exit_code=exit_code) from e
     except urllib.error.URLError as e:
@@ -682,6 +758,29 @@ def cmd_ask(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
 
     if failed:
         sys.exit(1)
+
+
+# Shortcuts over `ask` — frequent requests spelled as a dedicated command
+# instead of composing the natural-language prompt yourself every time.
+# Deliberately not new tool calls: this pre-fills `ask`'s message and runs
+# the exact same path (same engine, same per-tool permissions, same
+# streaming), so a shortcut works for anything Lia's existing tools already
+# cover, and never gets out of sync with what she can actually do. Shared
+# with the REPL's matching `/create-image`/`/create-video`/`/ads-report`
+# slash commands (see `repl.py`) so the wording is written once.
+SHORTCUT_PROMPTS: dict[str, str] = {
+    "create-image": "Create an image",
+    "create-video": "Create a video",
+    "ads-report": "Give me an ads performance report",
+}
+
+
+def _make_shortcut_cmd(base_prompt: str):
+    def _cmd(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+        args.message = f"{base_prompt}: {args.message}" if args.message else base_prompt
+        cmd_ask(args, parser)
+
+    return _cmd
 
 
 def cmd_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -996,6 +1095,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "  uptonica call catalog.stats.summary\n"
             "  uptonica tools --search contact\n"
             "  uptonica ask \"quanto ho venduto questo mese?\"\n"
+            "  uptonica create-image \"a black cat wearing sunglasses\"\n"
+            "  uptonica ads-report\n"
+            "  uptonica logout\n"
         ),
         parents=[output_parent],
     )
@@ -1109,6 +1211,29 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-browser", action="store_true", dest="no_browser",
                      help="Don't try to open a browser automatically — just print the URL and code")
     sp.set_defaults(func=cmd_login)
+
+    sp = sub.add_parser("logout", help="Remove the stored token from this machine (counterpart of `login`)")
+    sp.set_defaults(func=cmd_logout)
+
+    for name, base_prompt in SHORTCUT_PROMPTS.items():
+        sp = sub.add_parser(
+            name, help=f"Shortcut: asks Lia to “{base_prompt.lower()}”",
+            parents=[output_parent],
+            description=f"Shortcut over `ask` — pre-fills the message with “{base_prompt}” "
+                        "(plus whatever you add) and runs it exactly like `uptonica ask` would, "
+                        "same engine, same permissions, same streaming output.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=(
+                "examples:\n"
+                f"  uptonica {name}\n"
+                f"  uptonica {name} \"a black cat wearing sunglasses\" --tenant my-store\n"
+            ),
+        )
+        sp.add_argument("message", nargs="?", default=None, help="Extra detail to append to the shortcut's prompt")
+        sp.add_argument("--tenant", help="Workspace slug or id, if your token reaches more than one")
+        sp.add_argument("--conversation", metavar="UUID", help="Continue a specific thread instead of the last one")
+        sp.add_argument("--new", action="store_true", help="Start a new thread instead of continuing the last one")
+        sp.set_defaults(func=_make_shortcut_cmd(base_prompt))
 
     cfg = sub.add_parser("config", help="Manage the stored token")
     cfg_sub = cfg.add_subparsers(dest="config_command", required=True, metavar="<command>")

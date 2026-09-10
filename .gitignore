@@ -6,3 +6,8 @@ dist/
 build/
 .DS_Store
 .claude/worktrees/
+# This is a library published to PyPI, not an app — a committed lock file
+# would pin dev deps, not consumer deps, and isn't this repo's convention
+# (nothing has ever tracked one). Ignored rather than left as a recurring
+# `??` in every worktree's `git status`.
+uv.lock
