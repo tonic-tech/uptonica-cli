@@ -116,6 +116,18 @@ def _safe(s: Any, limit: int = 4000) -> str:
     return text if len(text) <= limit else text[:limit] + "...[truncated]"
 
 
+def _safe_line(s: Any) -> str:
+    """`_safe()` for a value that is supposed to be ONE line — a workspace
+    name printed next to its slug, never free-form diagnostic text.
+    `_safe()` alone keeps `\\n`/`\\t`, which is right for a multi-line error
+    body but wrong for a single label: a hostile `name` containing a
+    newline would print extra, unindented rows in a list a person is about
+    to pick a slug from by eye (`_prompt_default_workspace`). Mirrors
+    `repl.py`'s own `_safe_line` — same reasoning, same fix, this file just
+    never needed it until that list became a decision surface."""
+    return _safe(s).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+
+
 def _token() -> str:
     try:
         return resolve(env_var=TOKEN_ENV_VAR, keychain_item=KEYCHAIN_ITEM, validator=looks_like_sanctum_token)
@@ -547,8 +559,72 @@ def cmd_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
                f"saved — unset it if you want the new token to actually be used.")
     banner("Verifying...")
     data = _request("GET", "/whoami")
-    n = data.get("tenant_count", 0)
+    tenants = data.get("tenants", [])
+    n = data.get("tenant_count", len(tenants))
     banner(f"Logged in — this token reaches {n} workspace{'s' if n != 1 else ''}.")
+    _prompt_default_workspace(tenants)
+
+
+def _prompt_default_workspace(tenants: list) -> None:
+    """Called once, right after `login` confirms the token works — the
+    whole point is to leave the person able to run `ask`/`call` right away,
+    not needing to discover `tenant use` for themselves the first time a
+    bare `ask` 400s with `tenant_required` (the incident this exists to
+    prevent: a person's first question after logging in hit exactly that
+    error). Free of an extra round-trip: the `/whoami` `login` already made
+    to confirm the token works is the same list this reads.
+
+    Left alone (no prompt) when the CURRENT default is still among the
+    reachable workspaces — a fresh login with the same access shouldn't nag
+    about something already correctly set. It's only unset or now-stale
+    (the workspace it pointed at is no longer reachable — a scope change,
+    a revoked grant) that gets this to run again, same as no default at all.
+    """
+    valid = [t for t in tenants if isinstance(t.get("slug"), str) and TENANT_SLUG_RE.match(t["slug"])]
+    current = _read_default_tenant()
+    if current and any(t["slug"] == current for t in valid):
+        return
+    if not valid:
+        return
+    if len(valid) == 1:
+        # Nothing to choose between — setting it automatically is strictly
+        # friendlier than making the person type `tenant use` for the one
+        # slug they'd see if they ran `whoami` next anyway.
+        slug = valid[0]["slug"]
+        _write_default_tenant(slug)
+        banner(f"Default workspace set to {slug} ({_safe_line(valid[0].get('name', ''))}).")
+        return
+
+    banner("This token reaches more than one workspace:")
+    for t in valid[:20]:
+        banner(f"  {_safe_line(t['slug']):<30} {_safe_line(t.get('name', ''))}")
+    if len(valid) > 20:
+        banner(f"  ... and {len(valid) - 20} more (uptonica whoami --output json to see all)")
+
+    # Both streams, not just stdin: stdout redirected while stdin is still a
+    # real terminal (`uptonica login > log.txt`, run interactively) would
+    # otherwise send this prompt into the file — invisible, reads as a hang
+    # rather than a login that's actually waiting on you.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # Piped/scripted invocation — nothing to prompt into, and guessing
+        # which one to default to would be worse than asking explicitly.
+        banner("Pick one with: uptonica tenant use <slug>")
+        return
+    try:
+        choice = input("Set a default workspace now (slug, or Enter to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()  # the interrupted prompt line otherwise stays half-written
+        banner("Skipped — run `uptonica tenant use <slug>` any time.")
+        return
+    if not choice:
+        banner("Skipped — run `uptonica tenant use <slug>` any time.")
+        return
+    match = next((t for t in valid if t["slug"] == choice or str(t.get("id")) == choice), None)
+    if match is None:
+        err(f"ERROR: '{_safe(choice)}' isn't one of the workspaces above — not set. Run `uptonica tenant use <slug>` when you're ready.")
+        return
+    _write_default_tenant(match["slug"])
+    banner(f"Default workspace set to {match['slug']} ({_safe_line(match.get('name', ''))}).")
 
 
 def cmd_logout(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:

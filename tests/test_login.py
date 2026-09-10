@@ -315,3 +315,131 @@ def test_login_sanitizes_control_characters_from_server_strings(monkeypatch, cap
     # that followed it ("[2J" stays, just inert without the ESC in front).
     assert "\x1b" not in err_out
     assert "AB" in err_out and "CD" in err_out
+
+
+# --- _prompt_default_workspace: avoid logging in with no workspace picked ---
+#
+# Prompted by Tony hitting exactly this live: `uptonica login` succeeded,
+# then the very first `ask` 400'd with `tenant_required` because nothing had
+# ever set a default. These run `cli._prompt_default_workspace` directly —
+# unit-level, not through the whole `cmd_login` flow — since that's the only
+# new logic here; `cmd_login` itself already calls it (see the success-path
+# tests above still passing unchanged with an empty `tenants` list).
+
+
+def _tenant(slug: str, name: str = "", id_: int = 1) -> dict:
+    return {"slug": slug, "name": name, "id": id_}
+
+
+def test_single_reachable_workspace_is_set_automatically(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: None)
+    written = {}
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: written.setdefault("slug", slug))
+
+    cli._prompt_default_workspace([_tenant("acme", "Acme")])
+
+    assert written["slug"] == "acme"
+    assert "Default workspace set to acme" in capsys.readouterr().err
+
+
+def test_existing_valid_default_is_left_alone_silently(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: "acme")
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: pytest.fail("should not write — the current default is still reachable"))
+
+    cli._prompt_default_workspace([_tenant("acme"), _tenant("beta")])
+
+    assert capsys.readouterr().err == ""
+
+
+def test_stale_default_no_longer_reachable_is_treated_as_unset(monkeypatch, capsys):
+    """The workspace the stored default points at is gone (scope changed,
+    access revoked) — silently keeping it would be actively wrong, not
+    merely unhelpful, so this re-runs the same picker as a fresh login."""
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: "old-gone-tenant")
+    written = {}
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: written.setdefault("slug", slug))
+
+    cli._prompt_default_workspace([_tenant("acme")])
+
+    assert written["slug"] == "acme"
+
+
+def test_multiple_workspaces_interactive_pick_sets_the_chosen_one(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: None)
+    written = {}
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: written.setdefault("slug", slug))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "beta")
+
+    cli._prompt_default_workspace([_tenant("acme"), _tenant("beta", "Beta Co")])
+
+    assert written["slug"] == "beta"
+    assert "Default workspace set to beta" in capsys.readouterr().err
+
+
+def test_multiple_workspaces_interactive_skip_on_empty_input(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: None)
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: pytest.fail("should not write on a skipped prompt"))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    cli._prompt_default_workspace([_tenant("acme"), _tenant("beta")])
+
+    assert "Skipped" in capsys.readouterr().err
+
+
+def test_multiple_workspaces_bad_slug_typed_does_not_set_anything(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: None)
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: pytest.fail("should not write — the typed slug isn't in the list"))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "not-a-real-slug")
+
+    cli._prompt_default_workspace([_tenant("acme"), _tenant("beta")])
+
+    assert "isn't one of the workspaces" in capsys.readouterr().err
+
+
+def test_multiple_workspaces_non_interactive_just_prints_the_hint(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: None)
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: pytest.fail("should not write — nothing to prompt into"))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+
+    cli._prompt_default_workspace([_tenant("acme"), _tenant("beta")])
+
+    err_out = capsys.readouterr().err
+    assert "acme" in err_out and "beta" in err_out
+    assert "uptonica tenant use" in err_out
+
+
+def test_multiple_workspaces_skips_the_prompt_when_stdout_is_redirected(monkeypatch, capsys):
+    """A security review caught this: gating on `sys.stdin.isatty()` alone
+    misses `uptonica login > log.txt` run from a real terminal — stdin IS a
+    tty, but the prompt would be written into the redirected file, invisible
+    to the person watching the terminal. Reads as a hang, not a login
+    that's actually waiting on input."""
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: None)
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: pytest.fail("should not write — nothing to prompt into"))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": pytest.fail("must not prompt with stdout redirected"))
+
+    cli._prompt_default_workspace([_tenant("acme"), _tenant("beta")])
+
+    assert "uptonica tenant use" in capsys.readouterr().err
+
+
+def test_name_with_embedded_newline_does_not_add_extra_list_rows(monkeypatch, capsys):
+    """A hostile/malformed `name` must not be able to print extra,
+    unindented rows in a list a person is about to pick a slug from by
+    eye — `_safe_line()` folds it to one line instead."""
+    monkeypatch.setattr(cli, "_read_default_tenant", lambda: None)
+    monkeypatch.setattr(cli, "_write_default_tenant", lambda slug: pytest.fail("no interactive input available in this test"))
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+
+    cli._prompt_default_workspace([_tenant("acme", "Real Name\nFAKE ROW: rm -rf /"), _tenant("beta")])
+
+    lines = capsys.readouterr().err.splitlines()
+    assert not any("FAKE ROW" in line and "Real Name" not in line for line in lines)

@@ -616,14 +616,41 @@ class ReplApp(App[None]):
         # The new identity may not reach the workspace this session was
         # using (or reach none of the same ones) — clearing both rather
         # than silently keeping a stale tenant/thread pairing from before
-        # the switch. `/workspace` (or the same startup prompt `on_mount`
-        # runs) is how the person picks the new one. Both writes happen
-        # BEFORE `_end_turn` re-enables input, for the reason in this
-        # method's own docstring.
+        # the switch. Both writes happen BEFORE `_end_turn` re-enables
+        # input, for the reason in this method's own docstring.
         self.tenant = None
         self.conversation_uuid = None
         self.call_from_thread(self._refresh_border)
-        self.call_from_thread(self._line, f"[green]token salvato in {escape(_safe_line(where))}.[/green] /workspace per scegliere dove operare.")
+        self.call_from_thread(self._line, f"[green]token salvato in {escape(_safe_line(where))}.[/green]")
+
+        try:
+            # Fetched on THIS thread — already doing blocking network calls
+            # (the device-auth poll above), unlike `_pick_or_list_workspaces`
+            # below, which mutates widgets and must run on the main thread.
+            #
+            # `except Exception`, not just `SystemExit`: `_request()` only
+            # ever raises `SystemExit` for a response it recognized as an
+            # error, but a malformed 200 (wrong Content-Type, truncated
+            # body, a proxy/captive-portal HTML page) returns something
+            # that ISN'T the dict this code assumes — `.get()` on a `str`
+            # is an `AttributeError`, not caught by `except SystemExit`
+            # alone. That would escape this thread entirely, and with it
+            # `self._end_turn` below never runs — the input stays disabled
+            # forever, a security review caught exactly this. This whole
+            # follow-up call is optional polish on an already-successful
+            # login; ANY failure in it must fall through to re-enabling
+            # input, never take the thread down first.
+            data = _request("GET", "/whoami")
+            tenants = data.get("tenants", []) if isinstance(data, dict) else []
+        except SystemExit:
+            self.call_from_thread(self._line, "/workspace per scegliere dove operare.")
+        except Exception:
+            if os.environ.get("UPTONICA_DEBUG") == "1":
+                raise
+            self.call_from_thread(self._line, "/workspace per scegliere dove operare.")
+        else:
+            self.call_from_thread(self._pick_or_list_workspaces, tenants)
+
         self.call_from_thread(self._end_turn)
 
     def _switch_workspace(self, arg: str) -> None:
@@ -669,14 +696,7 @@ class ReplApp(App[None]):
         tenants = data.get("tenants", [])
 
         if not arg:
-            if not tenants:
-                self._line("[yellow]nessun workspace raggiungibile da questo token[/yellow]")
-                return
-            self._line("[bold]workspace raggiungibili[/bold]")
-            for t in tenants:
-                slug = escape(_safe_line(str(t.get("slug", "?"))))
-                name = escape(_safe_line(str(t.get("name", ""))))
-                self._line(f"  {slug}  {name}")
+            self._pick_or_list_workspaces(tenants)
             return
 
         match = next(
@@ -687,6 +707,32 @@ class ReplApp(App[None]):
             self._line(f"[red]'{escape(_safe_line(arg))}' non è un workspace raggiungibile da questo token.[/red] /workspace per la lista")
             return
 
+        self._select_workspace(match)
+
+    def _pick_or_list_workspaces(self, tenants: list) -> None:
+        """The "no argument" half of `/workspace` — factored out so the
+        startup check (`on_mount`) and the post-`/login` flow can call it
+        too, with the SAME auto-select behavior, instead of each re-picking
+        the list-vs-select logic slightly differently. Must run on the main
+        thread (mutates `self.tenant` and touches widgets via `_line`) —
+        `_login_blocking` reaches it through `call_from_thread`."""
+        if not tenants:
+            self._line("[yellow]nessun workspace raggiungibile da questo token[/yellow]")
+            return
+        if len(tenants) == 1:
+            # Nothing to choose between — printing a one-line "list" and
+            # still leaving `self.tenant` unset would just make the person
+            # retype the exact slug they were shown. Picking it is a no-op
+            # if it was already selected, and closes the gap if it wasn't.
+            self._select_workspace(tenants[0])
+            return
+        self._line("[bold]workspace raggiungibili[/bold]")
+        for t in tenants:
+            slug = escape(_safe_line(str(t.get("slug", "?"))))
+            name = escape(_safe_line(str(t.get("name", ""))))
+            self._line(f"  {slug}  {name}")
+
+    def _select_workspace(self, match: dict) -> None:
         slug = match.get("slug")
         if not isinstance(slug, str):
             self._line("[red]il workspace trovato non ha uno slug utilizzabile — non dovrebbe succedere lato server.[/red]")
