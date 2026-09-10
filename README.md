@@ -13,11 +13,20 @@ configure, not by which command you type.
 pip install uptonica   # or: uv tool install uptonica
 ```
 
-## Get a token
+## Log in
 
-Go to **Settings -> API Tokens** in your Uptonica workspace
-(`https://app.uptonica.com/account/api-tokens`), pick "Terminal access",
-choose which workspace(s) and areas it should reach, and copy it.
+```bash
+uptonica login
+```
+
+Opens your browser, you confirm the code and pick which workspace(s) and
+areas the token should reach, and the token comes back to the CLI on its
+own — no copy-paste. (On a machine with no browser, `uptonica login
+--no-browser` prints the URL and code to visit instead.)
+
+Prefer to mint the token yourself? Go to **Settings -> API Tokens** in your
+Uptonica workspace (`https://app.uptonica.com/account/api-tokens`), pick
+"Terminal access", choose scope, copy it, then:
 
 ```bash
 uptonica config set-token

@@ -187,8 +187,9 @@ def resolve(*, env_var: str, keychain_item: str, validator=None) -> str:
 
     raise CredentialError(
         f"No Uptonica token found (checked {env_var}, macOS Keychain, {_file_store_path()}).\n"
-        f"  Get one: https://app.uptonica.com/account/api-tokens\n"
-        f"  Then run: uptonica config set-token"
+        f"  Run: uptonica login\n"
+        f"  (or mint one yourself at https://app.uptonica.com/account/api-tokens "
+        f"and run: uptonica config set-token)"
     )
 
 
