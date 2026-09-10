@@ -38,10 +38,24 @@ def _restore_network_stubs():
     """`_open_ask_stream`/`_iter_sse`/`_request` get monkeypatched directly
     onto the `repl` module by individual tests (they're imported by name
     into it) — restore the real ones after each test so stubbing in one
-    test can't leak into the next."""
+    test can't leak into the next.
+
+    Also defaults `_request` to "no reachable workspaces" for every test,
+    captured BEFORE the override so teardown restores the true original,
+    not this default: `ReplApp.on_mount` now calls the same `/whoami`
+    request `/workspace` makes, at startup, whenever no tenant is set (see
+    the "entra subito" fix, 2026-09-10) — and most tests in this file
+    construct `ReplApp(None, ...)` for reasons that have nothing to do with
+    workspace listing, never anticipating a real network call on mount. A
+    test that cares about a specific `/whoami` response (the dead-token
+    `/workspace` test further down) overrides this with its own
+    `monkeypatch.setattr`/direct assignment, which simply wins for that
+    test — restored the same way at teardown either way.
+    """
     original_stream = repl._open_ask_stream
     original_sse = repl._iter_sse
     original_request = repl._request
+    repl._request = lambda *args, **kwargs: {"tenants": [], "tenant_count": 0}
     yield
     repl._open_ask_stream = original_stream
     repl._request = original_request
@@ -272,7 +286,15 @@ async def test_dead_token_on_workspace_shows_message_before_exiting():
 
     repl._request = dead_token_request
 
-    app = repl.ReplApp(None, None)
+    # A tenant already set, not `None` — `on_mount` now makes this same
+    # `/whoami` call itself whenever no tenant is set (see the "entra
+    # subito" fix, 2026-09-10), which would otherwise exit the app during
+    # mount and leave the `/workspace` keypresses below asserting nothing:
+    # this test is specifically about typing `/workspace` on a dead token,
+    # not about what mount does with one (see
+    # `test_startup_lists_workspaces_when_none_is_set` and friends for
+    # that).
+    app = repl.ReplApp("acme", None)
     exit_renderables_at_exit_call: list | None = None
     real_exit = app.exit
 
@@ -508,3 +530,191 @@ async def test_deprecation_banner_reaches_transcript():
         text = capture_text(app)
         assert "DEPRECATION" in text
         assert "2026-12-31" in text
+
+
+async def test_startup_lists_workspaces_when_none_is_set():
+    """The 'entra subito' fix (2026-09-10): a token reaching several
+    workspaces with no default used to only tell you so once you asked a
+    question and hit the server's `tenant_required` 400 — now it's shown
+    at mount, the same listing `/workspace` with no argument already
+    produces, so there's no failed round-trip before you find out."""
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        text = capture_text(app)
+        assert "workspace raggiungibili" in text
+        assert "acme" in text
+        assert "beta" in text
+
+
+async def test_startup_skips_the_whoami_call_when_a_tenant_is_already_set():
+    calls = []
+    repl._request = lambda *args, **kwargs: (calls.append(1), {"tenants": [], "tenant_count": 0})[1]
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert calls == []
+
+
+async def test_create_image_shortcut_composes_the_prompt():
+    _stub_noop_turn()
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press(*list("/create-image a black cat"))
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "Create an image: a black cat" in capture_text(app)
+
+
+async def test_ads_report_shortcut_without_extra_detail_uses_the_bare_prompt():
+    """No colon-and-nothing when the person doesn't add detail — `/ads-report`
+    alone should read as a complete sentence, not a prompt with a dangling
+    ':' at the end."""
+    _stub_noop_turn()
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press(*list("/ads-report"))
+        await pilot.press("enter")
+        await pilot.pause()
+        text = capture_text(app)
+        assert "Give me an ads performance report" in text
+        assert "Give me an ads performance report:" not in text
+
+
+async def test_logout_clears_the_token_and_exits(monkeypatch):
+    """No token left means `/workspace`/a question would just fail anyway
+    — exiting with a clear next step is the honest outcome, not a session
+    that silently can't do anything."""
+    monkeypatch.setattr(repl, "clear_token", lambda: ["macOS Keychain"])
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press(*list("/logout"))
+        await pilot.press("enter")
+        await pilot.pause()
+    assert not app.is_running
+
+
+async def test_logout_with_nothing_stored_does_not_exit(monkeypatch):
+    monkeypatch.setattr(repl, "clear_token", lambda: [])
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press(*list("/logout"))
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.is_running
+        assert "nessun token" in capture_text(app)
+
+
+async def test_login_reenables_input_only_after_token_and_tenant_are_settled(monkeypatch):
+    """Regression for a race a security review caught: a `finally:
+    call_from_thread(self._end_turn)` (copied from `_send_turn_blocking`,
+    wrong here) would re-enable input the instant `_device_login_flow`
+    returns — BEFORE `store_token()` and the tenant/conversation reset that
+    follow it on the success path. `__init__`'s own invariant is that those
+    off-thread writes are only safe because input stays disabled for the
+    WHOLE operation, so the ORDER here — not just the end state — is what
+    must hold."""
+    order: list[str] = []
+
+    monkeypatch.setattr(repl, "_device_login_flow", lambda no_browser, *, emit: "1|" + "a" * 24)
+    monkeypatch.setattr(repl, "store_token", lambda token: order.append("store_token") or "macOS Keychain")
+
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#input")
+
+        real_end_turn = app._end_turn
+        monkeypatch.setattr(app, "_end_turn", lambda: (order.append("end_turn"), real_end_turn())[1])
+
+        await pilot.press(*list("/login"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+    assert order == ["store_token", "end_turn"]
+
+
+async def test_login_slash_command_saves_the_token_and_prompts_for_a_workspace(monkeypatch):
+    def fake_flow(no_browser, *, emit):
+        assert no_browser is False
+        emit("Confirm this code in your browser: ABCD-EFGH")
+        return "1|" + "a" * 24
+
+    saved: dict[str, str] = {}
+    monkeypatch.setattr(repl, "_device_login_flow", fake_flow)
+    monkeypatch.setattr(repl, "store_token", lambda token: saved.setdefault("token", token) or "macOS Keychain")
+
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#input")
+        await pilot.press(*list("/login"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert not box.disabled
+        assert saved["token"].startswith("1|")
+        assert app.tenant is None  # old workspace context dropped for the new identity
+        text = capture_text(app)
+        assert "ABCD-EFGH" in text
+        assert "workspace" in text.lower()
+
+
+async def test_login_slash_command_no_browser_arg_is_passed_through(monkeypatch):
+    seen = {}
+
+    def fake_flow(no_browser, *, emit):
+        seen["no_browser"] = no_browser
+        return "1|" + "a" * 24
+
+    monkeypatch.setattr(repl, "_device_login_flow", fake_flow)
+    monkeypatch.setattr(repl, "store_token", lambda token: "macOS Keychain")
+
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#input")
+        await pilot.press(*list("/login no-browser"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert seen["no_browser"] is True
+
+
+async def test_login_failure_shows_the_error_and_reenables_input(monkeypatch):
+    def fake_flow(no_browser, *, emit):
+        raise repl.DeviceLoginError("login was denied in the browser.", 3)
+
+    monkeypatch.setattr(repl, "_device_login_flow", fake_flow)
+
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        box = app.query_one("#input")
+        await pilot.press(*list("/login"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert not box.disabled
+        assert app.is_running
+        assert "denied" in capture_text(app)

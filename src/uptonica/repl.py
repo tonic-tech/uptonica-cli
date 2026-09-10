@@ -37,9 +37,12 @@ from textual.widget import MountError
 from textual.widgets import Markdown, Static, TextArea
 
 from uptonica.cli import (
+    SHORTCUT_PROMPTS,
     UUID_RE,
     AskError,
+    DeviceLoginError,
     __version__,
+    _device_login_flow,
     _iter_sse,
     _open_ask_stream,
     _request,
@@ -47,9 +50,11 @@ from uptonica.cli import (
     _warn_if_deprecated,
     _write_last_conversation,
 )
-from uptonica.secrets import config_dir
+from uptonica.secrets import clear_token, store_token, config_dir
 
-SLASH_COMMANDS = ["/workspace", "/new", "/help", "/exit", "/quit"]
+SLASH_COMMANDS = ["/workspace", "/new", "/login", "/logout", "/help", "/exit", "/quit"] + [
+    f"/{name}" for name in SHORTCUT_PROMPTS
+]
 
 
 def _safe_line(s: object) -> str:
@@ -310,7 +315,8 @@ _MARKDOWN_REFRESH_INTERVAL = 1 / 12
 # user reads on the way out should be the same either way.
 _DEAD_TOKEN_MESSAGE = (
     "Il token non è più valido (revocato o scaduto). "
-    "Rigeneralo qui: https://app.uptonica.com/account/api-tokens"
+    "Rientra con `uptonica login`, oppure minta un token a mano qui: "
+    "https://app.uptonica.com/account/api-tokens"
 )
 
 
@@ -390,6 +396,16 @@ class ReplApp(App[None]):
         self.begin_capture_print(self)
         self._print_banner()
         self._refresh_border()
+        if self.tenant is None:
+            # Same listing `/workspace` (no argument) already prints — shown
+            # proactively at startup instead of waiting for the first
+            # question to hit the server's `tenant_required` 400 and only
+            # THEN telling the person what to do. A token with no default
+            # and more than one reachable workspace can't skip this pick
+            # (the server enforces it before Lia ever sees a message, not
+            # something a slash command can talk it out of) — the least a
+            # REPL can do is ask up front instead of after a failed turn.
+            self._switch_workspace("")
         self.query_one(MessageInput).focus()
 
     def on_print(self, event: events.Print) -> None:
@@ -467,6 +483,11 @@ class ReplApp(App[None]):
             "  /workspace          elenca i workspace raggiungibili da questo token\n"
             "  /workspace <slug>   passa a quel workspace (apre un thread nuovo)\n"
             "  /new                apre un thread nuovo nello stesso workspace\n"
+            "  /login              cambia identità (apre il browser, login da zero)\n"
+            "  /logout             rimuove il token salvato su questa macchina ed esce\n"
+            "  /create-image [...] scorciatoia: chiede a Lia di creare un'immagine\n"
+            "  /create-video [...] scorciatoia: chiede a Lia di creare un video\n"
+            "  /ads-report [...]   scorciatoia: chiede a Lia un report ads\n"
             "  /help               questo elenco\n"
             "  /exit, /quit        esce (anche Ctrl+D)\n"
             "\n"
@@ -525,8 +546,85 @@ class ReplApp(App[None]):
         if cmd == "/workspace":
             self._switch_workspace(arg)
             return
+        if cmd == "/logout":
+            self._logout()
+            return
+        if cmd == "/login":
+            self._login(no_browser=arg.strip().lower() == "no-browser")
+            return
+        for name, base_prompt in SHORTCUT_PROMPTS.items():
+            if cmd == f"/{name}":
+                self._start_turn(f"{base_prompt}: {arg}" if arg else base_prompt)
+                return
 
         self._line(f"[red]comando sconosciuto:[/red] {escape(_safe_line(cmd))} — /help per la lista")
+
+    def _logout(self) -> None:
+        removed = clear_token()
+        if not removed:
+            self._line("[yellow]nessun token salvato su questa macchina (Keychain o file).[/yellow]")
+            return
+        self._line(f"[green]rimosso da: {', '.join(escape(_safe_line(r)) for r in removed)}.[/green]")
+        # No token left to make the next turn/`/workspace` mean anything —
+        # exiting is the honest outcome, same shape as the dead-token exit
+        # elsewhere in this file, not a session that silently can't do
+        # anything until the person figures out why.
+        self.exit(message="Sei uscito. `uptonica login` per rientrare.")
+
+    def _login(self, *, no_browser: bool) -> None:
+        self._line("[bold]Login...[/bold] (`/login no-browser` per stampare solo il link)")
+        box = self.query_one(MessageInput)
+        box.disabled = True
+        threading.Thread(target=self._login_blocking, args=(no_browser,), daemon=True).start()
+
+    def _login_blocking(self, no_browser: bool) -> None:
+        """Runs on its own daemon thread — same reasoning as
+        `_send_turn_blocking`: `_device_login_flow`'s `time.sleep()` polling
+        loop must not block the Textual event loop, and this function is
+        its own backstop against an uncaught exception reaching the default
+        thread excepthook the way `_send_turn_blocking`'s docstring
+        explains for the turn case.
+
+        Deliberately NOT a `finally: call_from_thread(self._end_turn)` the
+        way `_send_turn_blocking` does it — that pattern re-enables input
+        the instant the `try` block exits, and on the success path here
+        that is BEFORE `store_token()` and the `self.tenant`/
+        `self.conversation_uuid` resets below it run. `__init__`'s own
+        invariant is that those two are only safe to write off-thread
+        because input stays disabled for the WHOLE operation — re-enabling
+        early reopens exactly the window that invariant exists to close: a
+        question typed the instant input comes back could start a turn
+        under the OLD tenant while `_token()` (reached fresh, no caching)
+        already resolves the NEW token from disk. So `_end_turn` is called
+        explicitly, once, only once every write below it has happened —
+        never through `finally`.
+        """
+        try:
+            token = _device_login_flow(no_browser, emit=lambda line: self.call_from_thread(self._line, escape(_safe_line(line))))
+        except DeviceLoginError as e:
+            self.call_from_thread(self._add_error, str(e))
+            self.call_from_thread(self._end_turn)
+            return
+        except Exception as e:  # see docstring: this IS the backstop, on this thread
+            if os.environ.get("UPTONICA_DEBUG") == "1":
+                raise
+            self.call_from_thread(self._add_error, f"{e.__class__.__name__}: unexpected failure.")
+            self.call_from_thread(self._end_turn)
+            return
+
+        where = store_token(token)
+        # The new identity may not reach the workspace this session was
+        # using (or reach none of the same ones) — clearing both rather
+        # than silently keeping a stale tenant/thread pairing from before
+        # the switch. `/workspace` (or the same startup prompt `on_mount`
+        # runs) is how the person picks the new one. Both writes happen
+        # BEFORE `_end_turn` re-enables input, for the reason in this
+        # method's own docstring.
+        self.tenant = None
+        self.conversation_uuid = None
+        self.call_from_thread(self._refresh_border)
+        self.call_from_thread(self._line, f"[green]token salvato in {escape(_safe_line(where))}.[/green] /workspace per scegliere dove operare.")
+        self.call_from_thread(self._end_turn)
 
     def _switch_workspace(self, arg: str) -> None:
         try:
