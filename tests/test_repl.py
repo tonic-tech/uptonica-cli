@@ -551,12 +551,12 @@ async def test_startup_lists_workspaces_when_none_is_set():
         assert "beta" in text
 
 
-async def test_typing_a_listed_slug_selects_that_workspace():
-    """Tony's own follow-up ask: "non sarebbe meglio che mi chiedesse quale
-    workspace in maniera interattiva?" — listing several options used to
-    just point at `/workspace <slug>` and leave the person to type the
-    whole command themselves. Now the very next plain line is tried as one
-    of the slugs just shown."""
+async def test_arrow_and_enter_selects_a_workspace_from_the_picker():
+    """Tony's own follow-up ask, the second round: "possiamo fare anche la
+    lista selezionabile con la freccia ed entrare nel workspace con
+    enter?" — the arrow-key `OptionList` this mounts has focus by default
+    the moment the list appears, so ↓ then Enter reaches it directly, no
+    click needed first."""
     repl._request = lambda *args, **kwargs: {
         "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
         "tenant_count": 2,
@@ -564,7 +564,169 @@ async def test_typing_a_listed_slug_selects_that_workspace():
     app = repl.ReplApp(None, None)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
+        picker = app.query_one("#workspace-picker")
+        assert app.focused is picker  # arrow keys work right away, no click needed
+        assert picker.option_count == 2
+
+        await pilot.press("down")  # acme (index 0) -> beta (index 1)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.tenant == "beta"
+        assert app._pending_workspace_pick is None
+        assert len(app.query("#workspace-picker")) == 0  # picker removed once resolved
+
+
+async def test_duplicate_slugs_do_not_crash_the_picker():
+    """A security review reproduced this live: two tenants sharing a slug
+    used to raise `OptionList`'s own `DuplicateID` uncaught, crashing
+    `on_mount` itself (Textual's fatal-error-with-locals renderer, dumping
+    the whole `/whoami` response). Deduped instead — the picker still
+    opens, once per distinct slug."""
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [
+            {"slug": "acme", "name": "Acme (first)"},
+            {"slug": "acme", "name": "Acme (duplicate)"},
+            {"slug": "beta", "name": "Beta"},
+        ],
+        "tenant_count": 3,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        picker = app.query_one("#workspace-picker")
+        assert picker.option_count == 2
+
+
+async def test_empty_string_slug_is_excluded_from_the_picker():
+    """An empty slug used to pass an `isinstance(..., str)`-only filter and
+    become a real, clickable option — picking it set `self.tenant = ""`, a
+    falsy value nothing downstream expects."""
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [
+            {"slug": "", "name": "Broken"},
+            {"slug": "acme", "name": "Acme"},
+            {"slug": "beta", "name": "Beta"},
+        ],
+        "tenant_count": 3,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        picker = app.query_one("#workspace-picker")
+        assert picker.option_count == 2
+        assert all(t.get("slug") for t in (app._pending_workspace_pick or []))
+
+
+async def test_no_valid_slugs_falls_back_cleanly_instead_of_a_stuck_state():
+    """Regression for a LOW finding: when NOTHING survives the slug
+    filter, the pick used to stay armed with no picker mounted and no
+    focus claimed — every later plain line silently rejected forever,
+    with the border still reading the generic "nessun workspace" (no
+    "data non valido" signal) since `_refresh_border` was never called on
+    that path either."""
+    _stub_noop_turn()
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "", "name": "Broken A"}, {"slug": "", "name": "Broken B"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+
+        assert len(app.query("#workspace-picker")) == 0
+        assert app._pending_workspace_pick is None
+        box = app.query_one("#input")
+        assert app.focused is box  # nothing pending -> input gets focus, not left stuck
+
+        # A normal question must reach Lia now, not be swallowed forever
+        # as a rejected "slug guess".
+        await pilot.press(*list("ciao"))
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "ciao" in capture_text(app)
+
+
+async def test_focus_returns_to_the_picker_after_a_turn_finishes_while_a_pick_is_pending():
+    """Regression for a HIGH finding: `_end_turn` (shared by the ordinary
+    turn-sending path and `/login`'s cleanup) used to just SKIP focusing
+    the input when a pick was pending, instead of focusing the picker. But
+    disabling then re-enabling a widget BLURS it in Textual — so skipping
+    the refocus left NOTHING meaningfully focused (not the input, not the
+    picker) the instant any turn finished while a pick was still open,
+    e.g. a shortcut run after clicking back into the box."""
+    _stub_noop_turn()
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        picker = app.query_one("#workspace-picker")
+        box = app.query_one("#input")
+        box.focus()  # simulate clicking back into the box to run a shortcut
+
+        await pilot.press(*list("/create-image a cat"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert app.tenant is None  # the pick never resolved
         assert app._pending_workspace_pick is not None
+        assert app.focused is picker  # NOT #history, and NOT left unfocused
+
+
+async def test_login_followup_pick_or_list_exception_still_reenables_input(monkeypatch):
+    """Regression for the other half of the same MEDIUM finding:
+    `_pick_or_list_workspaces` is dispatched via `call_from_thread` from
+    `_login_blocking`'s `else` clause — which used to sit OUTSIDE any
+    try/except there. An exception raised inside it (the `DuplicateID`
+    case before it was fixed at the source, or any future bug) would
+    escape onto the login thread and skip `_end_turn`, disabling input
+    forever — the exact class of bug a PRIOR review round already caught
+    once for the `/whoami` fetch itself, recurring one call further out."""
+    monkeypatch.setattr(repl, "_device_login_flow", lambda no_browser, *, emit: "1|" + "a" * 24)
+    monkeypatch.setattr(repl, "store_token", lambda token: "macOS Keychain")
+    monkeypatch.setattr(repl, "_request", lambda *a, **k: {"tenants": [{"slug": "acme", "name": "A"}], "tenant_count": 1})
+
+    def boom(tenants):
+        raise RuntimeError("simulated failure inside _pick_or_list_workspaces")
+
+    app = repl.ReplApp("some-tenant", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(app, "_pick_or_list_workspaces", boom)
+
+        box = app.query_one("#input")
+        await pilot.press(*list("/login"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert not box.disabled, "input stayed disabled forever — the exact bug this test guards against"
+        assert app.is_running
+
+
+async def test_typing_a_listed_slug_still_selects_that_workspace_as_a_fallback():
+    """The ORIGINAL interactive fix (a day earlier, before arrow-key
+    selection existed) still works — but only once the person explicitly
+    moves focus back to the input box (a click, in a real terminal): the
+    picker has focus by default, so plain keystrokes go to IT (its own
+    bindings — arrows, Home/End, Enter), not to `MessageInput`, until
+    something moves focus there."""
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.query_one("#input").focus()  # simulates clicking back into the box
 
         await pilot.press(*list("beta"))
         await pilot.press("enter")
@@ -574,7 +736,7 @@ async def test_typing_a_listed_slug_selects_that_workspace():
         assert app._pending_workspace_pick is None
 
 
-async def test_an_unlisted_slug_is_rejected_and_stays_pending():
+async def test_an_unlisted_typed_slug_is_rejected_and_stays_pending():
     repl._request = lambda *args, **kwargs: {
         "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
         "tenant_count": 2,
@@ -582,6 +744,7 @@ async def test_an_unlisted_slug_is_rejected_and_stays_pending():
     app = repl.ReplApp(None, None)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
+        app.query_one("#input").focus()
 
         await pilot.press(*list("not-a-real-slug"))
         await pilot.press("enter")
@@ -592,9 +755,13 @@ async def test_an_unlisted_slug_is_rejected_and_stays_pending():
         assert "non è uno degli slug elencati" in capture_text(app)
 
 
-async def test_slash_commands_still_work_while_a_workspace_pick_is_pending():
+async def test_slash_commands_still_work_once_focus_is_back_on_the_input():
     """A pending pick must not swallow `/exit`, `/help`, or an EXPLICIT
-    `/workspace <slug>` — only a plain (non-slash) line is reinterpreted."""
+    `/workspace <slug>` once the person is typing into the box — only a
+    plain (non-slash) line is reinterpreted, and only there. (With the
+    picker holding focus by default, `/` reaches it, not the input; this
+    is the "clicked back into the box" scenario, same as the typed-slug
+    fallback above.)"""
     repl._request = lambda *args, **kwargs: {
         "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
         "tenant_count": 2,
@@ -602,6 +769,7 @@ async def test_slash_commands_still_work_while_a_workspace_pick_is_pending():
     app = repl.ReplApp(None, None)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
+        app.query_one("#input").focus()
 
         await pilot.press(*list("/workspace beta"))
         await pilot.press("enter")
@@ -669,6 +837,7 @@ async def test_login_clears_a_stale_pending_pick_from_the_old_identity(monkeypat
         monkeypatch.setattr(repl, "_request", lambda *a, **k: {"tenants": [], "tenant_count": 0})
 
         box = app.query_one("#input")
+        box.focus()  # simulates clicking back into the box — the picker holds focus by default
         await pilot.press(*list("/login"))
         await pilot.press("enter")
         for _ in range(30):
