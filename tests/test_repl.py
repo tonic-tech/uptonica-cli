@@ -551,6 +551,139 @@ async def test_startup_lists_workspaces_when_none_is_set():
         assert "beta" in text
 
 
+async def test_typing_a_listed_slug_selects_that_workspace():
+    """Tony's own follow-up ask: "non sarebbe meglio che mi chiedesse quale
+    workspace in maniera interattiva?" — listing several options used to
+    just point at `/workspace <slug>` and leave the person to type the
+    whole command themselves. Now the very next plain line is tried as one
+    of the slugs just shown."""
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert app._pending_workspace_pick is not None
+
+        await pilot.press(*list("beta"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.tenant == "beta"
+        assert app._pending_workspace_pick is None
+
+
+async def test_an_unlisted_slug_is_rejected_and_stays_pending():
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+
+        await pilot.press(*list("not-a-real-slug"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.tenant is None
+        assert app._pending_workspace_pick is not None  # still waiting, not silently dropped
+        assert "non è uno degli slug elencati" in capture_text(app)
+
+
+async def test_slash_commands_still_work_while_a_workspace_pick_is_pending():
+    """A pending pick must not swallow `/exit`, `/help`, or an EXPLICIT
+    `/workspace <slug>` — only a plain (non-slash) line is reinterpreted."""
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+
+        await pilot.press(*list("/workspace beta"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.tenant == "beta"
+
+
+async def test_peeking_at_the_list_with_a_tenant_already_set_does_not_arm_the_pick():
+    """Regression for a MEDIUM finding a security review caught: arming
+    the pick unconditionally meant a bare `/workspace` typed just to LOOK
+    at the list — while already in a perfectly good workspace — silently
+    swallowed every question after it as a rejected slug guess, forever,
+    with no visible cue (the border still showed the old tenant name).
+    With a tenant already active, listing must stay read-only."""
+    _stub_noop_turn()
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "acme", "name": "Acme"}, {"slug": "beta", "name": "Beta"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp("acme", None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+
+        await pilot.press(*list("/workspace"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app._pending_workspace_pick is None
+        assert app.tenant == "acme"  # unchanged by a read-only peek
+
+        # A real question right after must still reach Lia, not get
+        # swallowed as a rejected workspace guess.
+        await pilot.press(*list("quante vendite ieri"))
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert "quante vendite ieri" in capture_text(app)
+        assert "non è uno degli slug" not in capture_text(app)
+
+
+async def test_login_clears_a_stale_pending_pick_from_the_old_identity(monkeypatch):
+    """Regression for a LOW/MEDIUM finding: without clearing this, a slug
+    from the OLD identity's workspace list could still be typed and
+    accepted against the NEW token after `/login` — `_select_workspace`
+    never re-verifies against a fresh whoami, it trusts whatever list it's
+    handed."""
+    repl._request = lambda *args, **kwargs: {
+        "tenants": [{"slug": "old-tenant-a", "name": "A"}, {"slug": "old-tenant-b", "name": "B"}],
+        "tenant_count": 2,
+    }
+    app = repl.ReplApp(None, None)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert app._pending_workspace_pick is not None  # startup armed it, from the OLD token
+
+        def fake_flow(no_browser, *, emit):
+            return "1|" + "b" * 24
+
+        monkeypatch.setattr(repl, "_device_login_flow", fake_flow)
+        monkeypatch.setattr(repl, "store_token", lambda token: "macOS Keychain")
+        # New identity reaches nothing yet (whoami not re-stubbed here) —
+        # what matters is that the OLD pending list doesn't survive the
+        # switch, not what replaces it.
+        monkeypatch.setattr(repl, "_request", lambda *a, **k: {"tenants": [], "tenant_count": 0})
+
+        box = app.query_one("#input")
+        await pilot.press(*list("/login"))
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if not box.disabled:
+                break
+
+        assert app._pending_workspace_pick is None
+        # The old slug must no longer be accepted as a plain-text pick.
+        await pilot.press(*list("old-tenant-a"))
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.tenant is None
+
+
 async def test_startup_skips_the_whoami_call_when_a_tenant_is_already_set():
     calls = []
     repl._request = lambda *args, **kwargs: (calls.append(1), {"tenants": [], "tenant_count": 0})[1]

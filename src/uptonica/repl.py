@@ -374,6 +374,14 @@ class ReplApp(App[None]):
         self._active_response = None  # set for the duration of a turn — see _send_turn_blocking/action_abort_turn
         self._aborting = False
         self.exit_code: int | None = None  # relays a sys.exit() raised on the turn thread — see _send_turn_blocking
+        # Set by `_pick_or_list_workspaces` whenever it lists more than one
+        # reachable workspace (nothing to auto-select) — the next PLAIN
+        # (non-slash) line submitted is then tried as a slug pick instead
+        # of being sent to Lia as a question, so listing several options
+        # actually lets you choose one instead of just telling you to run
+        # `/workspace <slug>` yourself. Cleared the moment a tenant is
+        # actually set (`_select_workspace`) or the list turns out empty.
+        self._pending_workspace_pick: list | None = None
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="history")
@@ -431,6 +439,9 @@ class ReplApp(App[None]):
         if self.tenant:
             box.border_title = escape(_safe_line(self.tenant))
             box.set_classes("has-tenant")
+        elif self._pending_workspace_pick:
+            box.border_title = "scegli un workspace"
+            box.set_classes("no-tenant")
         else:
             box.border_title = "nessun workspace"
             box.set_classes("no-tenant")
@@ -491,7 +502,9 @@ class ReplApp(App[None]):
             "  /help               questo elenco\n"
             "  /exit, /quit        esce (anche Ctrl+D)\n"
             "\n"
-            "qualsiasi altra riga è una domanda per Lia.\n"
+            "qualsiasi altra riga è una domanda per Lia — a meno che la lista dei "
+            "workspace non sia ancora in attesa di una scelta, nel qual caso conta "
+            "come lo slug da selezionare.\n"
             "Invio invia; Option+Invio (Alt+Invio) va a capo senza inviare.\n"
             "Ctrl+G interrompe una risposta in corso."
         )
@@ -526,7 +539,31 @@ class ReplApp(App[None]):
             self._handle_slash(text)
             return
 
+        if self._pending_workspace_pick is not None:
+            # A slash command (handled above already) still works while
+            # pending — /exit, /help, even /workspace itself all bypass
+            # this — but a PLAIN line is now tried as the slug someone just
+            # read off the list, not sent to Lia: nothing could answer it
+            # anyway without a tenant, so treating it as a question would
+            # only trade one confusing 400 for another.
+            self._try_pick_pending_workspace(text)
+            return
+
         self._start_turn(text)
+
+    def _try_pick_pending_workspace(self, text: str) -> None:
+        tenants = self._pending_workspace_pick or []
+        match = next(
+            (t for t in tenants if t.get("slug") == text or str(t.get("id")) == text),
+            None,
+        )
+        if match is None:
+            self._line(
+                f"[red]'{escape(_safe_line(text))}' non è uno degli slug elencati sopra.[/red] "
+                "Riprova con uno slug dalla lista, o /exit per uscire."
+            )
+            return
+        self._select_workspace(match)
 
     def _handle_slash(self, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -614,12 +651,18 @@ class ReplApp(App[None]):
 
         where = store_token(token)
         # The new identity may not reach the workspace this session was
-        # using (or reach none of the same ones) — clearing both rather
-        # than silently keeping a stale tenant/thread pairing from before
-        # the switch. Both writes happen BEFORE `_end_turn` re-enables
-        # input, for the reason in this method's own docstring.
+        # using (or reach none of the same ones) — clearing all three
+        # rather than silently keeping stale state from before the switch.
+        # `_pending_workspace_pick` matters here too: a security review
+        # caught that without clearing it, a slug from the OLD identity's
+        # list could still be typed and accepted against the NEW token —
+        # `_select_workspace` never re-verifies against a fresh whoami, it
+        # just trusts whatever list it was handed. All three writes happen
+        # BEFORE `_end_turn` re-enables input, for the reason in this
+        # method's own docstring.
         self.tenant = None
         self.conversation_uuid = None
+        self._pending_workspace_pick = None
         self.call_from_thread(self._refresh_border)
         self.call_from_thread(self._line, f"[green]token salvato in {escape(_safe_line(where))}.[/green]")
 
@@ -717,6 +760,7 @@ class ReplApp(App[None]):
         thread (mutates `self.tenant` and touches widgets via `_line`) —
         `_login_blocking` reaches it through `call_from_thread`."""
         if not tenants:
+            self._pending_workspace_pick = None
             self._line("[yellow]nessun workspace raggiungibile da questo token[/yellow]")
             return
         if len(tenants) == 1:
@@ -726,11 +770,25 @@ class ReplApp(App[None]):
             # if it was already selected, and closes the gap if it wasn't.
             self._select_workspace(tenants[0])
             return
+        # More than one. Only ARM the pick when there's no active tenant —
+        # a security review caught that arming it unconditionally let a
+        # bare `/workspace` typed just to peek at the list (while already
+        # in a perfectly good workspace) silently swallow every question
+        # after it as a rejected slug guess, forever, with the border still
+        # showing the OLD tenant name as the only — misleading — cue.
+        # With a tenant already set, this is a read-only listing, same as
+        # before this feature existed; only a genuinely tenant-less session
+        # gets the next plain line reinterpreted as a pick.
+        if self.tenant is None:
+            self._pending_workspace_pick = tenants
         self._line("[bold]workspace raggiungibili[/bold]")
         for t in tenants:
             slug = escape(_safe_line(str(t.get("slug", "?"))))
             name = escape(_safe_line(str(t.get("name", ""))))
             self._line(f"  {slug}  {name}")
+        if self.tenant is None:
+            self._line("[dim]scrivi lo slug per scegliere, o /exit per uscire[/dim]")
+        self._refresh_border()
 
     def _select_workspace(self, match: dict) -> None:
         slug = match.get("slug")
@@ -745,6 +803,7 @@ class ReplApp(App[None]):
         # on the next turn.
         self.tenant = slug
         self.conversation_uuid = None
+        self._pending_workspace_pick = None
         self._refresh_border()
 
     def _start_turn(self, message: str) -> None:
