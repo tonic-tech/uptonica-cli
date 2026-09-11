@@ -34,7 +34,8 @@ from textual.containers import VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widget import MountError
-from textual.widgets import Markdown, Static, TextArea
+from textual.widgets import Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
 from uptonica.cli import (
     SHORTCUT_PROMPTS,
@@ -414,7 +415,12 @@ class ReplApp(App[None]):
             # something a slash command can talk it out of) — the least a
             # REPL can do is ask up front instead of after a failed turn.
             self._switch_workspace("")
-        self.query_one(MessageInput).focus()
+        # NOT `self.query_one(MessageInput).focus()` unconditionally:
+        # `_switch_workspace("")` above may have just mounted an arrow-key
+        # picker and given IT focus — see `_focus_appropriate_widget`'s own
+        # docstring for why a NEGATIVE guard here (just skip focusing the
+        # input) is the wrong shape, not only an unconditional focus.
+        self._focus_appropriate_widget()
 
     def on_print(self, event: events.Print) -> None:
         text = event.text.rstrip("\n")
@@ -503,8 +509,8 @@ class ReplApp(App[None]):
             "  /exit, /quit        esce (anche Ctrl+D)\n"
             "\n"
             "qualsiasi altra riga è una domanda per Lia — a meno che la lista dei "
-            "workspace non sia ancora in attesa di una scelta, nel qual caso conta "
-            "come lo slug da selezionare.\n"
+            "workspace non sia ancora in attesa di una scelta (↑/↓ e Invio lì, o "
+            "scrivi lo slug), nel qual caso conta come lo slug da selezionare.\n"
             "Invio invia; Option+Invio (Alt+Invio) va a capo senza inviare.\n"
             "Ctrl+G interrompe una risposta in corso."
         )
@@ -653,16 +659,20 @@ class ReplApp(App[None]):
         # The new identity may not reach the workspace this session was
         # using (or reach none of the same ones) — clearing all three
         # rather than silently keeping stale state from before the switch.
-        # `_pending_workspace_pick` matters here too: a security review
-        # caught that without clearing it, a slug from the OLD identity's
-        # list could still be typed and accepted against the NEW token —
+        # The pending pick matters here too: a security review caught that
+        # without clearing it, a slug from the OLD identity's list could
+        # still be typed (or, since this session, clicked in a still-mounted
+        # picker widget) and accepted against the NEW token —
         # `_select_workspace` never re-verifies against a fresh whoami, it
-        # just trusts whatever list it was handed. All three writes happen
-        # BEFORE `_end_turn` re-enables input, for the reason in this
-        # method's own docstring.
+        # just trusts whatever list it was handed. `_clear_pending_pick`
+        # touches a widget (`OptionList.remove()`), so — unlike the plain
+        # `self.tenant`/`conversation_uuid` writes right below it — it MUST
+        # go through `call_from_thread`, not a direct attribute set. All of
+        # this happens BEFORE `_end_turn` re-enables input, for the reason
+        # in this method's own docstring.
         self.tenant = None
         self.conversation_uuid = None
-        self._pending_workspace_pick = None
+        self.call_from_thread(self._clear_pending_pick)
         self.call_from_thread(self._refresh_border)
         self.call_from_thread(self._line, f"[green]token salvato in {escape(_safe_line(where))}.[/green]")
 
@@ -692,7 +702,20 @@ class ReplApp(App[None]):
                 raise
             self.call_from_thread(self._line, "/workspace per scegliere dove operare.")
         else:
-            self.call_from_thread(self._pick_or_list_workspaces, tenants)
+            try:
+                # Same reasoning as the `_request` call above, one level
+                # further out: this dispatches onto the MAIN thread via
+                # `call_from_thread`, and an exception raised there is
+                # re-raised HERE, on this thread — a security review found
+                # this sitting outside any try/except, so anything
+                # `_pick_or_list_workspaces` raised (its own bug, or a
+                # future one) would skip `_end_turn` below and disable
+                # input forever, same failure shape as the whoami case.
+                self.call_from_thread(self._pick_or_list_workspaces, tenants)
+            except Exception:
+                if os.environ.get("UPTONICA_DEBUG") == "1":
+                    raise
+                self.call_from_thread(self._line, "/workspace per scegliere dove operare.")
 
         self.call_from_thread(self._end_turn)
 
@@ -760,7 +783,7 @@ class ReplApp(App[None]):
         thread (mutates `self.tenant` and touches widgets via `_line`) —
         `_login_blocking` reaches it through `call_from_thread`."""
         if not tenants:
-            self._pending_workspace_pick = None
+            self._clear_pending_pick()
             self._line("[yellow]nessun workspace raggiungibile da questo token[/yellow]")
             return
         if len(tenants) == 1:
@@ -778,17 +801,135 @@ class ReplApp(App[None]):
         # showing the OLD tenant name as the only — misleading — cue.
         # With a tenant already set, this is a read-only listing, same as
         # before this feature existed; only a genuinely tenant-less session
-        # gets the next plain line reinterpreted as a pick.
+        # gets an interactive picker.
         if self.tenant is None:
-            self._pending_workspace_pick = tenants
+            self._show_workspace_picker(tenants)
+            return
         self._line("[bold]workspace raggiungibili[/bold]")
         for t in tenants:
             slug = escape(_safe_line(str(t.get("slug", "?"))))
             name = escape(_safe_line(str(t.get("name", ""))))
             self._line(f"  {slug}  {name}")
-        if self.tenant is None:
-            self._line("[dim]scrivi lo slug per scegliere, o /exit per uscire[/dim]")
+
+    def _show_workspace_picker(self, tenants: list) -> None:
+        """Mounts an arrow-key/Enter-navigable list (↑/↓ then Enter, or a
+        mouse click) as the primary way to pick among several reachable
+        workspaces — requested live: "non sarebbe meglio che mi chiedesse
+        quale workspace in maniera interattiva?" after the plain listing
+        shipped a day earlier. Typing the slug directly (the ORIGINAL
+        interactive fix, `_try_pick_pending_workspace` below) still works
+        too — the `MessageInput` is never disabled here, so a click back
+        into it and a typed slug reaches the exact same `_select_workspace`
+        this list's own selection does; the picker just doesn't have
+        keyboard focus by default once it's up, so plain typing while it's
+        focused is consumed by the list (arrow/Home/End/PageUp-Down/Enter),
+        not sent anywhere as characters.
+
+        `markup=False` on the `OptionList`, not `escape()` on its prompts:
+        `escape()` inserts literal `\\[` sequences meant to survive Rich
+        markup PARSING — with markup off there is no parser to survive,
+        so escaping here would corrupt the visible text instead of
+        protecting it. Control-character stripping (`_safe_line`) still
+        applies since a hostile server-controlled `name` isn't otherwise
+        vetted before display.
+
+        Deduplicated by slug (`seen` below), and an empty string rejected
+        alongside a non-string — `OptionList` raises `DuplicateID` on two
+        options sharing an `id`, uncaught here, which used to crash the
+        whole REPL (a security review reproduced it live: two tenants
+        sharing a slug took down `on_mount` itself). `t['slug']` used to
+        be read via plain truthiness-free `isinstance` alone, which let an
+        EMPTY slug through as a real, selectable option — picking it set
+        `self.tenant = ""`, a falsy value nothing downstream expects.
+        """
+        valid_tenants = []
+        options = []
+        seen: set[str] = set()
+        for t in tenants:
+            slug = t.get("slug")
+            if not slug or not isinstance(slug, str) or slug in seen:
+                continue
+            seen.add(slug)
+            valid_tenants.append(t)
+            options.append(Option(f"{_safe_line(slug)}   {_safe_line(str(t.get('name', '')))}", id=slug))
+
+        self._clear_pending_pick()
+        if not options:
+            # Every tenant came back with an unusable slug (empty, wrong
+            # type, or a duplicate) — a server-side data problem, not
+            # something a picker can offer a choice about. Same outcome as
+            # "no workspace reachable at all", not a half-shown list with
+            # nothing left able to satisfy it.
+            self._line("[yellow]nessun workspace selezionabile da questo token (dati non validi dal server).[/yellow]")
+            self._refresh_border()
+            return
+
+        self._pending_workspace_pick = valid_tenants
+        self._line("[bold]workspace raggiungibili[/bold] — ↑/↓ e Invio per scegliere, o scrivi lo slug qui sotto")
+        picker = OptionList(*options, id="workspace-picker", markup=False)
+        history = self.query_one("#history", VerticalScroll)
+        history.mount(picker)
+        history.scroll_end(animate=False)
+        picker.focus()
         self._refresh_border()
+
+    def _clear_pending_pick(self) -> None:
+        """Drops the pending pick AND removes the picker widget if one is
+        still mounted — called before showing a fresh list (so a `/workspace`
+        typed again while one is already up doesn't stack a second one),
+        after a successful selection, and on `/login`'s identity switch (a
+        stale picker built from the OLD token's workspace list must not
+        survive to be clicked against the new one)."""
+        self._pending_workspace_pick = None
+        try:
+            picker = self.query_one("#workspace-picker", OptionList)
+        except NoMatches:
+            return
+        picker.remove()
+
+    def _focus_appropriate_widget(self) -> None:
+        """Focuses the workspace picker if a pick is still pending, else
+        the message input — the shared answer to "what should have
+        keyboard focus right now", used by every caller that just finished
+        something and needs to hand focus to whichever widget the person
+        should actually type into next.
+
+        A NEGATIVE guard here ("skip focusing the input when pending" —
+        what both callers used to do inline) is the wrong shape, not just
+        a less clear one: disabling then re-enabling `MessageInput` BLURS
+        it in Textual, so when the guard skips re-focusing it, focus falls
+        to the nearest focusable ancestor instead (`#history`, a plain
+        scroll container) — not to the picker, which nothing had told to
+        take it. That left NOTHING meaningfully focused whenever a picker
+        was up and `_end_turn` ran for an unrelated reason (a `/login`
+        failure, a shortcut's turn finishing) — a security review caught
+        it live: type afterward, and the keystrokes go nowhere. Trying the
+        picker FIRST and falling back to the input is the fix.
+        """
+        if self._pending_workspace_pick is not None:
+            try:
+                self.query_one("#workspace-picker", OptionList).focus()
+                return
+            except NoMatches:
+                pass  # pending but no widget (shouldn't happen — _clear_pending_pick keeps them in sync) — fall through
+        self.query_one(MessageInput).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "workspace-picker":
+            return  # not ours — nothing else in this app currently mounts an OptionList, defensive only
+        slug = event.option_id
+        tenants = self._pending_workspace_pick or []
+        match = next((t for t in tenants if t.get("slug") == slug), None)
+        if match is None:
+            # Can't happen in practice — every option's id came from this
+            # same tenants list a moment ago — but a match failing here
+            # must still leave the session usable rather than silently
+            # doing nothing.
+            self._clear_pending_pick()
+            self._line("[red]selezione non valida — riprova con /workspace.[/red]")
+            self.query_one(MessageInput).focus()
+            return
+        self._select_workspace(match)
 
     def _select_workspace(self, match: dict) -> None:
         slug = match.get("slug")
@@ -803,7 +944,8 @@ class ReplApp(App[None]):
         # on the next turn.
         self.tenant = slug
         self.conversation_uuid = None
-        self._pending_workspace_pick = None
+        self._clear_pending_pick()
+        self.query_one(MessageInput).focus()
         self._refresh_border()
 
     def _start_turn(self, message: str) -> None:
@@ -836,7 +978,19 @@ class ReplApp(App[None]):
         except NoMatches:
             return
         box.disabled = False
-        box.focus()
+        # NOT `box.focus()` unconditionally: `_login_blocking` (the OTHER
+        # caller of `_end_turn`, alongside the turn-sending path this
+        # method is named for) may have just mounted an arrow-key
+        # workspace picker via `_pick_or_list_workspaces` right before this
+        # runs. `_focus_appropriate_widget` handles that case explicitly —
+        # a plain "skip focusing the input" guard (what this used to be)
+        # left NOTHING focused: disabling then re-enabling a widget blurs
+        # it in Textual, so focus falls to the nearest focusable ancestor
+        # (`#history`, a plain scroll container) instead of staying on
+        # whatever the picker was — a security review caught this exact
+        # gap, verified live: type after a `/create-image` while a pick
+        # was pending, and the keystrokes went nowhere.
+        self._focus_appropriate_widget()
 
     def _add_tool_call(self, tool_name: str) -> None:
         self._line(f"  [{_TOOL_COLOR}]◐[/{_TOOL_COLOR}] {escape(_safe_line(tool_name))}...")
