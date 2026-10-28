@@ -35,6 +35,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import re
+import shlex
+import shutil
+import subprocess
 
 from uptonica.output import banner, emit, err
 from uptonica.secrets import (
@@ -859,6 +862,58 @@ def _make_shortcut_cmd(base_prompt: str):
     return _cmd
 
 
+
+# --- skills -------------------------------------------------------------
+
+def _claude(*argv: str) -> int:
+    """Run one `claude plugin ...` step, its output straight to the terminal."""
+    return subprocess.run(["claude", *argv], check=False).returncode
+
+
+def cmd_skills_install(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Install the private Uptonica content skills into Claude Code.
+
+    The server hands back THIS person's own marketplace link (team workspace
+    members only), and Claude Code is pointed at it. `--new` retires every link
+    handed out before, e.g. after one was pasted somewhere it should not be.
+    """
+    data = _request("POST", "/claude-skills/link", json_body={"new": bool(args.new)})
+    name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$")
+    link = data.get("marketplace_url") if isinstance(data, dict) else None
+    marketplace = data.get("marketplace") if isinstance(data, dict) else None
+    install = data.get("install") if isinstance(data, dict) else None
+    api_host = urllib.parse.urlparse(API).netloc
+    if (not isinstance(link, str) or urllib.parse.urlparse(link).scheme != "https"
+            or urllib.parse.urlparse(link).netloc != api_host
+            or not all(isinstance(v, str) and name.match(v) for v in (marketplace, install))):
+        err("ERROR: the server's answer is not a skills link this CLI can use. Update with `pip install -U uptonica`.")
+        sys.exit(1)
+
+    if args.print_link or shutil.which("claude") is None:
+        if not args.print_link:
+            err("Claude Code (`claude`) is not on PATH. Run these once it is:")
+        print(f"claude plugin marketplace add {shlex.quote(link)}")
+        print(f"claude plugin install {shlex.quote(install)}")
+        err("The link is personal: do not share it. `uptonica skills install --new` replaces it.")
+        return
+
+    # A link from an earlier install (or an old revision) is replaced, not kept beside.
+    subprocess.run(["claude", "plugin", "marketplace", "remove", marketplace],
+                   check=False, capture_output=True)
+    if _claude("plugin", "marketplace", "add", link) != 0:
+        err("ERROR: Claude Code refused the marketplace, and the earlier one was already removed. "
+            "Re-run, or use --print-link to do it by hand.")
+        sys.exit(1)
+    if _claude("plugin", "install", install) != 0:
+        err(f"ERROR: could not install {install}.")
+        sys.exit(1)
+
+    banner(f"Installed {data['plugin']} {data['version']}. Restart Claude Code, then ask "
+           "\"which Uptonica skills do you have?\".")
+    banner("The skills work through the Uptonica connector; if it is not connected yet:\n"
+           "  claude mcp add --transport http --scope user uptonica https://app.uptonica.com/mcp")
+
+
 def cmd_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     data = _request("GET", "/whoami")
     emit(data, explicit=args.output, pretty_renderer=_render_whoami)
@@ -1205,6 +1260,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--search", help="Filter to tools whose name, catalog name, label, or description matches (substring, case-insensitive)")
     sp.add_argument("--show", metavar="TOOL", help="Print full detail (description, parameters) for one tool")
     sp.set_defaults(func=cmd_tools)
+
+    sp = sub.add_parser("skills", help="Install the Uptonica content skills into Claude Code")
+    skills_sub = sp.add_subparsers(dest="skills_command", required=True, metavar="<command>")
+    si = skills_sub.add_parser(
+        "install", help="Add your personal skills link to Claude Code and install the plugin",
+        epilog=(
+            "examples:\n"
+            "  uptonica skills install\n"
+            "  uptonica skills install --new        # replace a link that leaked\n"
+            "  uptonica skills install --print-link # just print the commands\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    si.add_argument("--new", action="store_true",
+                    help="Retire every earlier link (they stop working at once) and install with a new one")
+    si.add_argument("--print-link", action="store_true", help="Print the commands instead of running them")
+    si.set_defaults(func=cmd_skills_install)
 
     sp = sub.add_parser("tenant", help="Manage the default workspace for `call`")
     tenant_sub = sp.add_subparsers(dest="tenant_command", required=True, metavar="<command>")
