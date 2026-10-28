@@ -51,7 +51,7 @@ from uptonica.secrets import (
     store_token,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 TOKEN_ENV_VAR = "UPTONICA_TOKEN"
 KEYCHAIN_ITEM = "uptonica-token"
 TOOL_NAME_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)*$")
@@ -866,7 +866,7 @@ def _make_shortcut_cmd(base_prompt: str):
 # --- skills -------------------------------------------------------------
 
 def _claude(*argv: str) -> int:
-    """Run one `claude plugin ...` step, its output straight to the terminal."""
+    """Run one `claude plugin ...` or `claude mcp ...` step, its output straight to the terminal."""
     return subprocess.run(["claude", *argv], check=False).returncode
 
 
@@ -889,12 +889,20 @@ def cmd_skills_install(args: argparse.Namespace, parser: argparse.ArgumentParser
         err("ERROR: the server's answer is not a skills link this CLI can use. Update with `pip install -U uptonica`.")
         sys.exit(1)
 
+    # Only the real app is saved into Claude's config: an UPTONICA_API_BASE
+    # override (staging, local, or planted) would outlive the shell it was set
+    # in and route every later Claude session there. Printed, never added.
+    mcp_url = "https://app.uptonica.com/mcp"
+    default_base = BASE == "https://app.uptonica.com"
+
     if args.print_link or shutil.which("claude") is None:
         if not args.print_link:
             err("Claude Code (`claude`) is not on PATH. Run these once it is:")
         print(f"claude plugin marketplace add {shlex.quote(link)}")
         print(f"claude plugin install {shlex.quote(install)}")
+        print(f"claude mcp add --transport http --scope user uptonica {shlex.quote(mcp_url)}")
         err("The link is personal: do not share it. `uptonica skills install --new` replaces it.")
+        err("Skip the last line if Uptonica is already connected in Claude.")
         return
 
     # A link from an earlier install (or an old revision) is replaced, not kept beside.
@@ -908,10 +916,31 @@ def cmd_skills_install(args: argparse.Namespace, parser: argparse.ArgumentParser
         err(f"ERROR: could not install {install}.")
         sys.exit(1)
 
-    banner(f"Installed {data['plugin']} {data['version']}. Restart Claude Code, then ask "
-           "\"which Uptonica skills do you have?\".")
-    banner("The skills work through the Uptonica connector; if it is not connected yet:\n"
-           "  claude mcp add --transport http --scope user uptonica https://app.uptonica.com/mcp")
+    # The skills work through the connector: add it unless one is there
+    # already, under any name (the claude.ai connector shows as "claude.ai
+    # Uptonica"), so the tools never appear twice.
+    if not default_base:
+        err("UPTONICA_API_BASE is set, so the connector is not added for you. If you want it:\n"
+            f"  claude mcp add --transport http --scope user uptonica {mcp_url}")
+    elif not _uptonica_connected():
+        if _claude("mcp", "add", "--transport", "http", "--scope", "user", "uptonica", mcp_url) != 0:
+            err("ERROR: the skills are installed, but the Uptonica connector could not be added. Run:\n"
+                f"  claude mcp add --transport http --scope user uptonica {mcp_url}")
+            sys.exit(1)
+
+    banner(f"Installed {data['plugin']} {data['version']}. Restart Claude Code, then:\n"
+           "  1. /mcp, pick Uptonica, Authenticate, choose the workspace (first time only)\n"
+           "  2. ask \"which Uptonica skills do you have?\"")
+
+
+def _uptonica_connected() -> bool:
+    """Whether Claude Code already has an Uptonica connector, by any name."""
+    found = subprocess.run(["claude", "mcp", "get", "uptonica"], check=False, capture_output=True, text=True)
+    if found.returncode == 0:
+        return True
+    # A miss lists what IS configured: "Configured servers: a, claude.ai Uptonica, b".
+    listed = (found.stdout + found.stderr).partition("Configured servers:")[2]
+    return any(name.strip().lower() in ("uptonica", "claude.ai uptonica") for name in listed.split(","))
 
 
 def cmd_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
