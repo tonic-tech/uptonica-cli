@@ -53,7 +53,59 @@ def test_it_replaces_the_marketplace_then_installs(server, monkeypatch):
         ["claude", "plugin", "marketplace", "remove", "uptonica-skills"],
         ["claude", "plugin", "marketplace", "add", LINK["marketplace_url"]],
         ["claude", "plugin", "install", "uptonica-content@uptonica-skills"],
+        ["claude", "mcp", "get", "uptonica"],
     ]
+
+
+def _claude_with(monkeypatch, configured: str):
+    """A `claude` whose `mcp get uptonica` misses, listing these servers."""
+    ran = []
+
+    def run(argv, **kw):
+        ran.append(argv)
+        if argv[1:3] == ["mcp", "get"]:
+            return type("R", (), {"returncode": 1, "stdout": "",
+                                  "stderr": f'No MCP server named "uptonica". Configured servers: {configured}'})()
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/claude")
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    return ran
+
+
+def test_it_adds_the_connector_when_none_is_there(server, monkeypatch):
+    ran = _claude_with(monkeypatch, "ghl, playwright")
+
+    cli.cmd_skills_install(_args(), parser=None)
+
+    assert ran[-1] == ["claude", "mcp", "add", "--transport", "http", "--scope", "user",
+                       "uptonica", "https://app.uptonica.com/mcp"]
+
+
+def test_a_claude_ai_connector_counts_as_connected(server, monkeypatch):
+    ran = _claude_with(monkeypatch, "claude.ai ClickUp, claude.ai Uptonica, ghl")
+
+    cli.cmd_skills_install(_args(), parser=None)
+
+    assert not any(argv[1:3] == ["mcp", "add"] for argv in ran)
+
+
+def test_a_server_override_never_saves_a_connector(server, monkeypatch, capsys):
+    ran = _claude_with(monkeypatch, "ghl")
+    monkeypatch.setattr(cli, "BASE", "https://staging.example.com")
+
+    cli.cmd_skills_install(_args(), parser=None)
+
+    assert not any(argv[1:3] == ["mcp", "add"] for argv in ran)
+    assert "https://app.uptonica.com/mcp" in capsys.readouterr().err
+
+
+def test_an_old_connector_name_does_not_count(server, monkeypatch):
+    ran = _claude_with(monkeypatch, "uptonica-old, ghl")
+
+    cli.cmd_skills_install(_args(), parser=None)
+
+    assert ran[-1][1:3] == ["mcp", "add"]
 
 
 def test_new_asks_the_server_for_a_new_link(server, monkeypatch):
@@ -72,6 +124,7 @@ def test_without_claude_it_prints_the_commands(server, monkeypatch, capsys):
     out = capsys.readouterr()
     assert f"claude plugin marketplace add '{LINK['marketplace_url']}'" in out.out
     assert "claude plugin install uptonica-content@uptonica-skills" in out.out
+    assert "claude mcp add --transport http --scope user uptonica https://app.uptonica.com/mcp" in out.out
     assert "not on PATH" in out.err
 
 
